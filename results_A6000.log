@@ -1,0 +1,35 @@
+=== Green Context Bandwidth Saturation Benchmark ===
+GPU:             NVIDIA RTX A6000
+Compute Cap:     8.6
+Total SMs:       84
+Buffer Size:     512 MB
+Iterations:      20 (per trial)
+Trials:          5 (median)
+SM Granularity:  4
+SM Step:         4
+
+Full-GPU bandwidth (median of 5 trials): 337.17 GB/s
+
+  SM=4 (alloc=4): 78.73 GB/s (23.3%)
+  SM=8 (alloc=8): 157.09 GB/s (46.6%)
+  SM=12 (alloc=12): 236.71 GB/s (70.2%)
+  SM=16 (alloc=16): 323.98 GB/s (96.1%)
+  SM=20 (alloc=20): 332.13 GB/s (98.5%)
+  SM=24 (alloc=24): 335.12 GB/s (99.4%)
+  SM=28 (alloc=28): 336.65 GB/s (99.8%)
+  SM=32 (alloc=32): 339.65 GB/s (100.7%)
+  SM=36 (alloc=36): 340.57 GB/s (101.0%)
+  SM=40 (alloc=40): 340.67 GB/s (101.0%)
+  SM=44 (alloc=44): 341.21 GB/s (101.2%)
+  SM=48 (alloc=48): 340.80 GB/s (101.1%)
+  SM=52 (alloc=52): 340.37 GB/s (100.9%)
+  SM=56 (alloc=56): 340.49 GB/s (101.0%)
+  SM=60 (alloc=60): 339.96 GB/s (100.8%)
+  SM=64 (alloc=64): 339.97 GB/s (100.8%)
+  SM=68 (alloc=68): 339.08 GB/s (100.6%)
+  SM=72 (alloc=72): 338.52 GB/s (100.4%)
+  SM=76 (alloc=76): 338.21 GB/s (100.3%)
+  SM=80 (alloc=80): 337.51 GB/s (100.1%)
+
+=== Summary ===
+Full-GPU BW (baseline): 337.17 GB/s

@@ -2,10 +2,10 @@
 green_ctx_bw_bench
 *.o
 
-# Results (regenerated per-run)
+# Results (regenerated per-run, unsuffixed only)
 results.csv
 results.log
-*.png
+bw_saturation.png
 
 # Editor
 .vscode/

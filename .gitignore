@@ -1,0 +1,13 @@
+# Build artifacts
+green_ctx_bw_bench
+*.o
+
+# Results (regenerated per-run)
+results.csv
+results.log
+*.png
+
+# Editor
+.vscode/
+*.swp
+*~

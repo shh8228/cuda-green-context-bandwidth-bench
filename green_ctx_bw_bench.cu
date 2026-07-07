@@ -46,7 +46,10 @@ enum class LoadMode {
     Tma = 4,
 };
 
-static constexpr size_t kTmaTileBytes = 4096;
+static constexpr size_t kTmaTileBytes = 16384;
+static constexpr size_t kTmaRowBytes = 256;
+static constexpr size_t kTmaRowsPerTile = kTmaTileBytes / kTmaRowBytes;
+static constexpr size_t kTmaFloat4sPerRow = kTmaRowBytes / sizeof(float4);
 static constexpr size_t kTmaTileFloat4s = kTmaTileBytes / sizeof(float4);
 
 static LoadMode g_load_mode = LoadMode::Default;
@@ -208,36 +211,56 @@ read_bandwidth_kernel_tma(const float4 *__restrict__ src,
                           const CUtensorMap *tensor_map)
 {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-    __shared__ alignas(16) unsigned char smem_tile[kTmaTileBytes];
-    __shared__ cuda::barrier<cuda::thread_scope_block> bar;
-    float4 *tile = reinterpret_cast<float4 *>(smem_tile);
+    __shared__ alignas(16) unsigned char smem_tiles[2][kTmaTileBytes];
+    __shared__ cuda::barrier<cuda::thread_scope_block> bars[2];
+    float4 *tiles[2] = {
+        reinterpret_cast<float4 *>(smem_tiles[0]),
+        reinterpret_cast<float4 *>(smem_tiles[1]),
+    };
 
     if (threadIdx.x == 0) {
-        init(&bar, 1);
+        init(&bars[0], 1);
+        init(&bars[1], 1);
     }
     __syncthreads();
 
     float4 accum = make_float4(0.f, 0.f, 0.f, 0.f);
-    const size_t total_bytes = n_float4 * sizeof(float4);
     const size_t tile_bytes = kTmaTileBytes;
-    const size_t tile_rows = 16;
-    const size_t float4s_per_row = 16;
+    const size_t tile_rows = kTmaRowsPerTile;
+    const size_t float4s_per_row = kTmaFloat4sPerRow;
+    const size_t tile_stride_rows = (size_t)gridDim.x * tile_rows;
 
-    for (size_t tile_row = blockIdx.x * tile_rows;
-         tile_row * sizeof(float4) < total_bytes;
-         tile_row += (size_t)gridDim.x * tile_rows) {
-        if (threadIdx.x == 0) {
-            auto token = cuda::device::barrier_arrive_tx(bar, 1, tile_bytes);
-            cuda::device::experimental::cp_async_bulk_tensor_2d_global_to_shared(
-                smem_tile, tensor_map, static_cast<int>(tile_row), 0, bar);
-            bar.wait(std::move(token));
+    auto issue_tile = [&](int stage, size_t tile_row) {
+        auto token = cuda::device::barrier_arrive_tx(bars[stage], 1, tile_bytes);
+        cuda::device::experimental::cp_async_bulk_tensor_2d_global_to_shared(
+            smem_tiles[stage], tensor_map, static_cast<int>(tile_row), 0, bars[stage]);
+        return token;
+    };
+
+    size_t tile_row = blockIdx.x * tile_rows;
+    size_t next_tile_row = tile_row + tile_stride_rows;
+    int stage = 0;
+    int next_stage = 1;
+
+    if (tile_row * float4s_per_row < n_float4 && threadIdx.x == 0) {
+        auto token = issue_tile(stage, tile_row);
+        bars[stage].wait(std::move(token));
+    }
+
+    while (tile_row * float4s_per_row < n_float4) {
+        __syncthreads();
+
+        if (threadIdx.x == 0 && next_tile_row * float4s_per_row < n_float4) {
+            auto token = issue_tile(next_stage, next_tile_row);
+            (void)token;
         }
+
         __syncthreads();
 
         for (size_t i = threadIdx.x; i < kTmaTileFloat4s; i += blockDim.x) {
             size_t global_float4 = tile_row * float4s_per_row + i;
             if (global_float4 < n_float4) {
-                float4 v = tile[i];
+                float4 v = tiles[stage][i];
                 accum.x += v.x;
                 accum.y += v.y;
                 accum.z += v.z;
@@ -245,6 +268,11 @@ read_bandwidth_kernel_tma(const float4 *__restrict__ src,
             }
         }
         __syncthreads();
+
+        tile_row = next_tile_row;
+        next_tile_row += tile_stride_rows;
+        stage ^= 1;
+        next_stage ^= 1;
     }
 
     if (threadIdx.x == 0) {
@@ -330,9 +358,9 @@ static bool build_tma_context(CUdevice cuDev, const float4 *d_src, size_t buf_by
     }
 
     CUtensorMap host_map{};
-    const cuuint64_t global_dim[2] = { static_cast<cuuint64_t>(buf_bytes / 256), 256 };
-    const cuuint64_t global_strides[1] = { 256 };
-    const cuuint32_t box_dim[2] = { 16, 256 };
+    const cuuint64_t global_dim[2] = { static_cast<cuuint64_t>(buf_bytes / kTmaRowBytes), kTmaRowBytes };
+    const cuuint64_t global_strides[1] = { kTmaRowBytes };
+    const cuuint32_t box_dim[2] = { static_cast<cuuint32_t>(kTmaRowsPerTile), static_cast<cuuint32_t>(kTmaRowBytes) };
     const cuuint32_t element_strides[2] = { 1, 1 };
 
     CUDA_DRIVER_CHECK(cuTensorMapEncodeTiled(&host_map,

@@ -6,6 +6,8 @@ green_ctx_bw_bench
 results.csv
 results.log
 bw_saturation.png
+*.ncu_rep
+*ncu*
 
 # Editor
 .vscode/

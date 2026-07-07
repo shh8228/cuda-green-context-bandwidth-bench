@@ -19,7 +19,7 @@
  *   nvcc -O3 -std=c++17 -arch=sm_100 green_ctx_bw_bench.cu -o green_ctx_bw_bench -lcuda
  *
  * Run:
- *   ./green_ctx_bw_bench [buffer_size_MB] [iterations] [gpu_id] [sm_step] [trials]
+ *   ./green_ctx_bw_bench [buffer_size_MB] [iterations] [gpu_id] [sm_step] [trials] [use_l1_bypass]
  *
  * Output: CSV to stdout with columns:
  *   sm_count_requested, sm_count_allocated, bandwidth_GBps, pct_of_full_gpu
@@ -34,6 +34,19 @@
 #include <algorithm>
 #include <numeric>
 #include <cassert>
+#include <cooperative_groups.h>
+#include <cooperative_groups/memcpy_async.h>
+#include <cuda/barrier>
+ 
+enum class LoadMode {
+    Default = 0,
+    L1Bypass = 1,
+    CpAsync = 2,
+    PipelineAsync = 3,
+    Tma = 4,
+};
+
+static LoadMode g_load_mode = LoadMode::Default;
 
 // ---------------------------------------------------------------------------
 // Error checking macros
@@ -90,6 +103,164 @@ read_bandwidth_kernel(const float4 *__restrict__ src,
 }
 
 // ---------------------------------------------------------------------------
+// L1-bypass variant (non-cacheable loads) using inline PTX
+// Uses ld.global.nc.v4.f32 to request non-cacheable global loads.
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ float4 load_nc_f4(const float4 *addr)
+{
+    float4 out;
+    asm volatile(
+        "ld.global.cg.v4.f32 {%0, %1, %2, %3}, [%4];\n"
+        : "=f"(out.x), "=f"(out.y), "=f"(out.z), "=f"(out.w)
+        : "l"(addr));
+    return out;
+}
+
+__device__ __forceinline__ void cp_async_16B(void *smem_ptr, const void *gmem_ptr)
+{
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+    asm volatile(
+        "cp.async.cg.shared.global [%0], [%1], %2;\n"
+        :: "r"(smem), "l"(gmem_ptr), "n"(16));
+#endif
+}
+
+__device__ __forceinline__ void cp_async_commit()
+{
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.commit_group;\n" ::);
+#endif
+}
+
+__device__ __forceinline__ void cp_async_wait0()
+{
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.wait_group 0;\n" ::);
+#endif
+}
+
+__global__ void __launch_bounds__(256)
+read_bandwidth_kernel_cp_async(const float4 *__restrict__ src,
+                               float *__restrict__ sink,
+                               size_t n_float4)
+{
+    extern __shared__ float4 smem[];
+
+    size_t tid = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    size_t stride = (size_t)blockDim.x * gridDim.x;
+
+    float4 accum = make_float4(0.f, 0.f, 0.f, 0.f);
+
+    for (size_t i = tid; i < n_float4; i += stride) {
+        cp_async_16B(&smem[threadIdx.x], &src[i]);
+        cp_async_commit();
+        cp_async_wait0();
+        __syncthreads();
+
+        float4 v = smem[threadIdx.x];
+        accum.x += v.x;
+        accum.y += v.y;
+        accum.z += v.z;
+        accum.w += v.w;
+    }
+
+    if (tid < stride)
+        sink[tid] = accum.x + accum.y + accum.z + accum.w;
+}
+
+__global__ void __launch_bounds__(256)
+read_bandwidth_kernel_pipeline(const float4 *__restrict__ src,
+                               float *__restrict__ sink,
+                               size_t n_float4)
+{
+    namespace cg = cooperative_groups;
+    auto block = cg::this_thread_block();
+    extern __shared__ float4 smem[];
+
+    size_t tid = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    size_t stride = (size_t)blockDim.x * gridDim.x;
+
+    float4 accum = make_float4(0.f, 0.f, 0.f, 0.f);
+
+    for (size_t i = tid; i < n_float4; i += stride) {
+        cg::memcpy_async(block, &smem[threadIdx.x], &src[i], sizeof(float4));
+        cg::wait(block);
+
+        float4 v = smem[threadIdx.x];
+        accum.x += v.x;
+        accum.y += v.y;
+        accum.z += v.z;
+        accum.w += v.w;
+    }
+
+    if (tid < stride)
+        sink[tid] = accum.x + accum.y + accum.z + accum.w;
+}
+
+__global__ void __launch_bounds__(1)
+read_bandwidth_kernel_tma(const float4 *__restrict__ src,
+                          float *__restrict__ sink,
+                          size_t n_float4,
+                          const CUtensorMap *tensor_map)
+{
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    __shared__ alignas(16) float4 smem_tile;
+    __shared__ cuda::barrier<cuda::thread_scope_block> bar;
+
+    if (threadIdx.x == 0) {
+        cuda::device::init(&bar, 1);
+    }
+    __syncthreads();
+
+    const size_t tid = blockIdx.x;
+    const size_t stride = (size_t)gridDim.x;
+    float4 accum = make_float4(0.f, 0.f, 0.f, 0.f);
+
+    for (size_t coord = tid * sizeof(float4); coord < n_float4 * sizeof(float4); coord += stride * sizeof(float4)) {
+        auto token = cuda::device::barrier_arrive_tx(bar, 1, sizeof(float4));
+        cuda::device::cp_async_bulk_tensor_1d_global_to_shared(
+            &smem_tile, tensor_map, static_cast<int>(coord), bar);
+        bar.wait(std::move(token));
+
+        accum.x += smem_tile.x;
+        accum.y += smem_tile.y;
+        accum.z += smem_tile.z;
+        accum.w += smem_tile.w;
+    }
+
+    sink[tid] = accum.x + accum.y + accum.z + accum.w;
+#else
+    (void)src;
+    (void)sink;
+    (void)n_float4;
+    (void)tensor_map;
+#endif
+}
+
+__global__ void __launch_bounds__(256)
+read_bandwidth_kernel_nc(const float4 *__restrict__ src,
+                         float *__restrict__ sink,
+                         size_t n_float4)
+{
+    size_t tid = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    size_t stride = (size_t)blockDim.x * gridDim.x;
+
+    float4 accum = make_float4(0.f, 0.f, 0.f, 0.f);
+
+    for (size_t i = tid; i < n_float4; i += stride) {
+        float4 v = load_nc_f4(&src[i]);
+        accum.x += v.x;
+        accum.y += v.y;
+        accum.z += v.z;
+        accum.w += v.w;
+    }
+
+    if (tid < stride)
+        sink[tid] = accum.x + accum.y + accum.z + accum.w;
+}
+
+// ---------------------------------------------------------------------------
 // Helper: compute median of a vector
 // ---------------------------------------------------------------------------
 static double median(std::vector<double> &v)
@@ -101,13 +272,107 @@ static double median(std::vector<double> &v)
     return (v[n / 2 - 1] + v[n / 2]) / 2.0;
 }
 
+struct TmaContext {
+    CUtensorMap *d_tensor_map = nullptr;
+    bool enabled = false;
+};
+
+static const char *load_mode_name(LoadMode mode)
+{
+    switch (mode) {
+    case LoadMode::Default: return "Default (__ldg)";
+    case LoadMode::L1Bypass: return "L1-bypass (ld.global.cg)";
+    case LoadMode::CpAsync: return "cp.async staging";
+    case LoadMode::PipelineAsync: return "pipeline async staging";
+    case LoadMode::Tma: return "TMA (cp.async.bulk.tensor)";
+    }
+    return "Unknown";
+}
+
+static bool uses_shared_staging(LoadMode mode)
+{
+    return mode == LoadMode::CpAsync || mode == LoadMode::PipelineAsync;
+}
+
+static bool uses_tma(LoadMode mode)
+{
+    return mode == LoadMode::Tma;
+}
+
+static bool build_tma_context(CUdevice cuDev, const float4 *d_src, size_t buf_bytes,
+                              TmaContext *tma_ctx)
+{
+    int cc_major = 0;
+    CUDA_DRIVER_CHECK(cuDeviceGetAttribute(&cc_major,
+        CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, cuDev));
+    if (cc_major < 9 || tma_ctx == nullptr) {
+        return false;
+    }
+
+    CUtensorMap host_map{};
+    const cuuint64_t global_dim[1] = { static_cast<cuuint64_t>(buf_bytes) };
+    const cuuint64_t global_strides[1] = { 1 };
+    const cuuint32_t box_dim[1] = { 16 };
+    const cuuint32_t element_strides[1] = { 1 };
+
+    CUDA_DRIVER_CHECK(cuTensorMapEncodeTiled(&host_map,
+                                             CU_TENSOR_MAP_DATA_TYPE_UINT8,
+                                             1,
+                                             const_cast<float4 *>(d_src),
+                                             global_dim,
+                                             global_strides,
+                                             box_dim,
+                                             element_strides,
+                                             CU_TENSOR_MAP_INTERLEAVE_NONE,
+                                             CU_TENSOR_MAP_SWIZZLE_NONE,
+                                             CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
+                                             CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
+
+    CUtensorMap *d_map = nullptr;
+    CUDA_RT_CHECK(cudaMalloc(&d_map, sizeof(CUtensorMap)));
+    CUDA_RT_CHECK(cudaMemcpy(d_map, &host_map, sizeof(CUtensorMap), cudaMemcpyHostToDevice));
+
+    tma_ctx->d_tensor_map = d_map;
+    tma_ctx->enabled = true;
+    return true;
+}
+
+static void launch_selected_kernel(const float4 *d_src, float *d_sink,
+                                   size_t n_float4, int blocks, int threads,
+                                   cudaStream_t stream,
+                                   const TmaContext &tma_ctx)
+{
+    const size_t shared_bytes = uses_shared_staging(g_load_mode)
+        ? (size_t)threads * sizeof(float4)
+        : 0;
+
+    switch (g_load_mode) {
+    case LoadMode::Default:
+        read_bandwidth_kernel<<<blocks, threads, 0, stream>>>(d_src, d_sink, n_float4);
+        break;
+    case LoadMode::L1Bypass:
+        read_bandwidth_kernel_nc<<<blocks, threads, 0, stream>>>(d_src, d_sink, n_float4);
+        break;
+    case LoadMode::CpAsync:
+        read_bandwidth_kernel_cp_async<<<blocks, threads, shared_bytes, stream>>>(d_src, d_sink, n_float4);
+        break;
+    case LoadMode::PipelineAsync:
+        read_bandwidth_kernel_pipeline<<<blocks, threads, shared_bytes, stream>>>(d_src, d_sink, n_float4);
+        break;
+    case LoadMode::Tma:
+        read_bandwidth_kernel_tma<<<blocks, 1, 0, stream>>>(d_src, d_sink, n_float4, tma_ctx.d_tensor_map);
+        break;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Measure bandwidth with a given stream, returning median over trials
 // ---------------------------------------------------------------------------
 static double measure_bandwidth_timed(cudaStream_t stream,
                                       const float4 *d_src, float *d_sink,
                                       size_t n_float4, int blocks, int iters,
-                                      int trials, size_t buf_bytes)
+                                      int trials, size_t buf_bytes,
+                                      const TmaContext &tma_ctx)
 {
     cudaEvent_t start, stop;
     CUDA_RT_CHECK(cudaEventCreate(&start));
@@ -116,8 +381,9 @@ static double measure_bandwidth_timed(cudaStream_t stream,
     const int threads = 256;
 
     // Extended warmup (5 kernel launches)
-    for (int i = 0; i < 5; ++i)
-        read_bandwidth_kernel<<<blocks, threads, 0, stream>>>(d_src, d_sink, n_float4);
+    for (int i = 0; i < 5; ++i) {
+        launch_selected_kernel(d_src, d_sink, n_float4, blocks, threads, stream, tma_ctx);
+    }
     CUDA_RT_CHECK(cudaStreamSynchronize(stream));
 
     std::vector<double> bw_samples;
@@ -125,8 +391,9 @@ static double measure_bandwidth_timed(cudaStream_t stream,
 
     for (int t = 0; t < trials; ++t) {
         CUDA_RT_CHECK(cudaEventRecord(start, stream));
-        for (int i = 0; i < iters; ++i)
-            read_bandwidth_kernel<<<blocks, threads, 0, stream>>>(d_src, d_sink, n_float4);
+        for (int i = 0; i < iters; ++i) {
+            launch_selected_kernel(d_src, d_sink, n_float4, blocks, threads, stream, tma_ctx);
+        }
         CUDA_RT_CHECK(cudaEventRecord(stop, stream));
         CUDA_RT_CHECK(cudaEventSynchronize(stop));
 
@@ -148,7 +415,8 @@ static double measure_bandwidth_timed(cudaStream_t stream,
 // ---------------------------------------------------------------------------
 static double measure_bandwidth_default(const float4 *d_src, float *d_sink,
                                         size_t n_float4, int sm_count,
-                                        int iters, int trials, size_t buf_bytes)
+                                        int iters, int trials, size_t buf_bytes,
+                                        const TmaContext &tma_ctx)
 {
     const int threads = 256;
     const int blocks = std::min((int)((n_float4 + threads - 1) / threads),
@@ -158,7 +426,7 @@ static double measure_bandwidth_default(const float4 *d_src, float *d_sink,
     CUDA_RT_CHECK(cudaStreamCreate(&stream));
 
     double bw = measure_bandwidth_timed(stream, d_src, d_sink, n_float4,
-                                        blocks, iters, trials, buf_bytes);
+                                        blocks, iters, trials, buf_bytes, tma_ctx);
 
     CUDA_RT_CHECK(cudaStreamDestroy(stream));
     return bw;
@@ -172,7 +440,8 @@ static double measure_bandwidth_green_ctx(CUdevice cuDev,
                                           const float4 *d_src, float *d_sink,
                                           size_t n_float4, int iters,
                                           int trials, size_t buf_bytes,
-                                          int allocated_sms)
+                                          int allocated_sms,
+                                          const TmaContext &tma_ctx)
 {
     // 1. Generate resource descriptor
     CUdevResourceDesc desc;
@@ -198,7 +467,7 @@ static double measure_bandwidth_green_ctx(CUdevice cuDev,
                                 allocated_sms * 32);
 
     double bw = measure_bandwidth_timed(stream, d_src, d_sink, n_float4,
-                                        blocks, iters, trials, buf_bytes);
+                                        blocks, iters, trials, buf_bytes, tma_ctx);
 
     // Cleanup
     CUDA_RT_CHECK(cudaStreamDestroy(stream));
@@ -221,6 +490,8 @@ int main(int argc, char **argv)
     int    dev_id   = (argc > 3) ? atoi(argv[3]) : 0;
     int    sm_step  = (argc > 4) ? atoi(argv[4]) : 0;     // 0 = auto
     int    trials   = (argc > 5) ? atoi(argv[5]) : 5;     // median of N trials
+    int    mode     = (argc > 6) ? atoi(argv[6]) : 0;
+    g_load_mode = static_cast<LoadMode>(std::max(0, std::min(mode, 4)));
 
     // ---- Initialize CUDA Driver API ----
     CUDA_DRIVER_CHECK(cuInit(0));
@@ -254,6 +525,7 @@ int main(int argc, char **argv)
     fprintf(stderr, "Buffer Size:     %zu MB\n", buf_mb);
     fprintf(stderr, "Iterations:      %d (per trial)\n", iters);
     fprintf(stderr, "Trials:          %d (median)\n", trials);
+    fprintf(stderr, "Load Mode:       %s\n", load_mode_name(g_load_mode));
 
     // Determine SM granularity for this architecture
     // Blackwell (10.x) / Hopper (9.x): 8 SM granularity
@@ -292,10 +564,22 @@ int main(int argc, char **argv)
     CUDA_RT_CHECK(cudaMemset(d_src, 0x42, buf_bytes));
     CUDA_RT_CHECK(cudaMemset(d_sink, 0, sink_size));
 
+    TmaContext tma_ctx{};
+    if (uses_tma(g_load_mode)) {
+        if (cc_major < 9) {
+            fprintf(stderr, "TMA mode requires SM90+; this GPU is %d.%d\n", cc_major, cc_minor);
+            return EXIT_FAILURE;
+        }
+        if (!build_tma_context(cuDev, d_src, buf_bytes, &tma_ctx)) {
+            fprintf(stderr, "Failed to build TMA tensor map\n");
+            return EXIT_FAILURE;
+        }
+    }
+
     // ---- Baseline: full-GPU bandwidth ----
     double bw_full = measure_bandwidth_default(d_src, d_sink, n_float4,
                                                 totalSMs, iters, trials,
-                                                buf_bytes);
+                                                buf_bytes, tma_ctx);
     fprintf(stderr, "Full-GPU bandwidth (median of %d trials): %.2f GB/s\n\n",
             trials, bw_full);
 
@@ -332,7 +616,7 @@ int main(int argc, char **argv)
         double bw = measure_bandwidth_green_ctx(cuDev, &partition,
                                                  d_src, d_sink, n_float4,
                                                  iters, trials, buf_bytes,
-                                                 allocated);
+                                                 allocated, tma_ctx);
 
         double pct = (bw / bw_full) * 100.0;
 
@@ -348,6 +632,9 @@ int main(int argc, char **argv)
     fprintf(stderr, "Full-GPU BW (baseline): %.2f GB/s\n", bw_full);
 
     // ---- Cleanup ----
+    if (tma_ctx.enabled && tma_ctx.d_tensor_map != nullptr) {
+        CUDA_RT_CHECK(cudaFree(tma_ctx.d_tensor_map));
+    }
     CUDA_RT_CHECK(cudaFree(d_src));
     CUDA_RT_CHECK(cudaFree(d_sink));
 

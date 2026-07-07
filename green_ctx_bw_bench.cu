@@ -209,7 +209,7 @@ read_bandwidth_kernel_tma(const float4 *__restrict__ src,
     __shared__ cuda::barrier<cuda::thread_scope_block> bar;
 
     if (threadIdx.x == 0) {
-        cuda::device::init(&bar, 1);
+        init(&bar, 1);
     }
     __syncthreads();
 
@@ -219,7 +219,7 @@ read_bandwidth_kernel_tma(const float4 *__restrict__ src,
 
     for (size_t coord = tid * sizeof(float4); coord < n_float4 * sizeof(float4); coord += stride * sizeof(float4)) {
         auto token = cuda::device::barrier_arrive_tx(bar, 1, sizeof(float4));
-        cuda::device::cp_async_bulk_tensor_1d_global_to_shared(
+        cuda::device::experimental::cp_async_bulk_tensor_1d_global_to_shared(
             &smem_tile, tensor_map, static_cast<int>(coord), bar);
         bar.wait(std::move(token));
 

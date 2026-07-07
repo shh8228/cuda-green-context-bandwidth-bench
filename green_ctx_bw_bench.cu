@@ -229,6 +229,8 @@ read_bandwidth_kernel_tma(const float4 *__restrict__ src,
     const size_t tile_rows = kTmaRowsPerTile;
     const size_t float4s_per_row = kTmaFloat4sPerRow;
     const size_t tile_stride_rows = (size_t)gridDim.x * tile_rows;
+    cuda::barrier<cuda::thread_scope_block>::arrival_token pending_token;
+    bool has_pending_tile = false;
 
     auto issue_tile = [&](int stage, size_t tile_row) {
         auto token = cuda::device::barrier_arrive_tx(bars[stage], 1, tile_bytes);
@@ -243,16 +245,16 @@ read_bandwidth_kernel_tma(const float4 *__restrict__ src,
     int next_stage = 1;
 
     if (tile_row * float4s_per_row < n_float4 && threadIdx.x == 0) {
-        auto token = issue_tile(stage, tile_row);
-        bars[stage].wait(std::move(token));
+        pending_token = issue_tile(stage, tile_row);
+        bars[stage].wait(std::move(pending_token));
     }
 
     while (tile_row * float4s_per_row < n_float4) {
         __syncthreads();
 
         if (threadIdx.x == 0 && next_tile_row * float4s_per_row < n_float4) {
-            auto token = issue_tile(next_stage, next_tile_row);
-            (void)token;
+            pending_token = issue_tile(next_stage, next_tile_row);
+            has_pending_tile = true;
         }
 
         __syncthreads();
@@ -267,6 +269,13 @@ read_bandwidth_kernel_tma(const float4 *__restrict__ src,
                 accum.w += v.w;
             }
         }
+        __syncthreads();
+
+        if (threadIdx.x == 0 && has_pending_tile) {
+            bars[next_stage].wait(std::move(pending_token));
+            has_pending_tile = false;
+        }
+
         __syncthreads();
 
         tile_row = next_tile_row;

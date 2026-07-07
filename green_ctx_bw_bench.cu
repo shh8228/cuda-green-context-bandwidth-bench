@@ -235,7 +235,7 @@ read_bandwidth_kernel_tma(const float4 *__restrict__ src,
     auto issue_tile = [&](int stage, size_t tile_row) {
         auto token = cuda::device::barrier_arrive_tx(bars[stage], 1, tile_bytes);
         cuda::device::experimental::cp_async_bulk_tensor_2d_global_to_shared(
-            smem_tiles[stage], tensor_map, static_cast<int>(tile_row), 0, bars[stage]);
+            smem_tiles[stage], tensor_map, 0, static_cast<int>(tile_row), bars[stage]);
         return token;
     };
 
@@ -367,9 +367,9 @@ static bool build_tma_context(CUdevice cuDev, const float4 *d_src, size_t buf_by
     }
 
     CUtensorMap host_map{};
-    const cuuint64_t global_dim[2] = { static_cast<cuuint64_t>(buf_bytes / kTmaRowBytes), kTmaRowBytes };
-    const cuuint64_t global_strides[1] = { kTmaRowBytes };
-    const cuuint32_t box_dim[2] = { static_cast<cuuint32_t>(kTmaRowsPerTile), static_cast<cuuint32_t>(kTmaRowBytes) };
+    const cuuint64_t global_dim[2]     = { kTmaRowBytes, buf_bytes / kTmaRowBytes };
+    const cuuint64_t global_strides[1] = { kTmaRowBytes };            // dim1 간 stride = 256 bytes
+    const cuuint32_t box_dim[2]        = { kTmaRowBytes, kTmaRowsPerTile };  // {256, 64}
     const cuuint32_t element_strides[2] = { 1, 1 };
 
     CUDA_DRIVER_CHECK(cuTensorMapEncodeTiled(&host_map,

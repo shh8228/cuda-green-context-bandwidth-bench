@@ -46,6 +46,9 @@ enum class LoadMode {
     Tma = 4,
 };
 
+static constexpr size_t kTmaTileBytes = 4096;
+static constexpr size_t kTmaTileFloat4s = kTmaTileBytes / sizeof(float4);
+
 static LoadMode g_load_mode = LoadMode::Default;
 
 // ---------------------------------------------------------------------------
@@ -198,38 +201,55 @@ read_bandwidth_kernel_pipeline(const float4 *__restrict__ src,
         sink[tid] = accum.x + accum.y + accum.z + accum.w;
 }
 
-__global__ void __launch_bounds__(1)
+__global__ void __launch_bounds__(256)
 read_bandwidth_kernel_tma(const float4 *__restrict__ src,
                           float *__restrict__ sink,
                           size_t n_float4,
                           const CUtensorMap *tensor_map)
 {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-    __shared__ alignas(16) float4 smem_tile;
+    __shared__ alignas(16) unsigned char smem_tile[kTmaTileBytes];
     __shared__ cuda::barrier<cuda::thread_scope_block> bar;
+    float4 *tile = reinterpret_cast<float4 *>(smem_tile);
 
     if (threadIdx.x == 0) {
         init(&bar, 1);
     }
     __syncthreads();
 
-    const size_t tid = blockIdx.x;
-    const size_t stride = (size_t)gridDim.x;
     float4 accum = make_float4(0.f, 0.f, 0.f, 0.f);
+    const size_t total_bytes = n_float4 * sizeof(float4);
+    const size_t tile_bytes = kTmaTileBytes;
+    const size_t tile_rows = 16;
+    const size_t float4s_per_row = 16;
 
-    for (size_t coord = tid * sizeof(float4); coord < n_float4 * sizeof(float4); coord += stride * sizeof(float4)) {
-        auto token = cuda::device::barrier_arrive_tx(bar, 1, sizeof(float4));
-        cuda::device::experimental::cp_async_bulk_tensor_1d_global_to_shared(
-            &smem_tile, tensor_map, static_cast<int>(coord), bar);
-        bar.wait(std::move(token));
+    for (size_t tile_row = blockIdx.x * tile_rows;
+         tile_row * sizeof(float4) < total_bytes;
+         tile_row += (size_t)gridDim.x * tile_rows) {
+        if (threadIdx.x == 0) {
+            auto token = cuda::device::barrier_arrive_tx(bar, 1, tile_bytes);
+            cuda::device::experimental::cp_async_bulk_tensor_2d_global_to_shared(
+                smem_tile, tensor_map, static_cast<int>(tile_row), 0, bar);
+            bar.wait(std::move(token));
+        }
+        __syncthreads();
 
-        accum.x += smem_tile.x;
-        accum.y += smem_tile.y;
-        accum.z += smem_tile.z;
-        accum.w += smem_tile.w;
+        for (size_t i = threadIdx.x; i < kTmaTileFloat4s; i += blockDim.x) {
+            size_t global_float4 = tile_row * float4s_per_row + i;
+            if (global_float4 < n_float4) {
+                float4 v = tile[i];
+                accum.x += v.x;
+                accum.y += v.y;
+                accum.z += v.z;
+                accum.w += v.w;
+            }
+        }
+        __syncthreads();
     }
 
-    sink[tid] = accum.x + accum.y + accum.z + accum.w;
+    if (threadIdx.x == 0) {
+        sink[blockIdx.x] = accum.x + accum.y + accum.z + accum.w;
+    }
 #else
     (void)src;
     (void)sink;
@@ -310,14 +330,14 @@ static bool build_tma_context(CUdevice cuDev, const float4 *d_src, size_t buf_by
     }
 
     CUtensorMap host_map{};
-    const cuuint64_t global_dim[1] = { static_cast<cuuint64_t>(buf_bytes) };
-    const cuuint64_t global_strides[1] = { 1 };
-    const cuuint32_t box_dim[1] = { 16 };
-    const cuuint32_t element_strides[1] = { 1 };
+    const cuuint64_t global_dim[2] = { static_cast<cuuint64_t>(buf_bytes / 256), 256 };
+    const cuuint64_t global_strides[1] = { 256 };
+    const cuuint32_t box_dim[2] = { 16, 256 };
+    const cuuint32_t element_strides[2] = { 1, 1 };
 
     CUDA_DRIVER_CHECK(cuTensorMapEncodeTiled(&host_map,
                                              CU_TENSOR_MAP_DATA_TYPE_UINT8,
-                                             1,
+                                             2,
                                              const_cast<float4 *>(d_src),
                                              global_dim,
                                              global_strides,
@@ -325,7 +345,7 @@ static bool build_tma_context(CUdevice cuDev, const float4 *d_src, size_t buf_by
                                              element_strides,
                                              CU_TENSOR_MAP_INTERLEAVE_NONE,
                                              CU_TENSOR_MAP_SWIZZLE_NONE,
-                                             CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
+                                             CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
                                              CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
 
     CUtensorMap *d_map = nullptr;
@@ -360,7 +380,7 @@ static void launch_selected_kernel(const float4 *d_src, float *d_sink,
         read_bandwidth_kernel_pipeline<<<blocks, threads, shared_bytes, stream>>>(d_src, d_sink, n_float4);
         break;
     case LoadMode::Tma:
-        read_bandwidth_kernel_tma<<<blocks, 1, 0, stream>>>(d_src, d_sink, n_float4, tma_ctx.d_tensor_map);
+        read_bandwidth_kernel_tma<<<blocks, 256, 0, stream>>>(d_src, d_sink, n_float4, tma_ctx.d_tensor_map);
         break;
     }
 }

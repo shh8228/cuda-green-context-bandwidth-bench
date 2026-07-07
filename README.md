@@ -76,7 +76,7 @@ bash run_bench.sh 512 20 0 0
 - `1`: L1-bypass path using `ld.global.cg`.
 - `2`: Explicit `cp.async` shared-memory staging.
 - `3`: Cooperative-groups async staging path, useful as the closest portable precursor to Hopper/Blackwell-style async copy flows.
-- `4`: Hopper/Blackwell TMA path using a 1D tensor map and `cp.async.bulk.tensor.1d`.
+- `4`: Hopper/Blackwell TMA path using a 2D tensor map and `cp.async.bulk.tensor.2d`.
 
 Note: `load_mode=4` requires compute capability 9.0 or higher.
 

@@ -56,7 +56,10 @@ static constexpr size_t kTmaRowsPerTransfer = kTmaTransferBytes / kTmaRowBytes;
 static constexpr size_t kTmaRowsPerStage = kTmaStageBytes / kTmaRowBytes;
 static constexpr size_t kTmaFloat4sPerRow = kTmaRowBytes / sizeof(float4);
 static constexpr size_t kTmaStageFloat4s = kTmaStageBytes / sizeof(float4);
-static constexpr size_t kTmaDynamicSmemBytes = kTmaStages * kTmaStageBytes;
+using TmaBarrier = cuda::barrier<cuda::thread_scope_block>;
+static constexpr size_t kTmaBarrierBytes = kTmaStages * sizeof(TmaBarrier);
+static constexpr size_t kTmaDynamicSmemBytes =
+    kTmaStages * kTmaStageBytes + kTmaBarrierBytes;
 static_assert(kTmaTransferBytes <= 16384, "A single TMA transfer cannot exceed 16 KiB");
 static_assert(kTmaStageBytes % kTmaTransferBytes == 0,
               "A TMA stage must contain whole transfers");
@@ -225,8 +228,10 @@ read_bandwidth_kernel_tma(const float4 *__restrict__ src,
                           const CUtensorMap *tensor_map)
 {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-    extern __shared__ __align__(16) unsigned char smem_tiles_raw[];
-    __shared__ cuda::barrier<cuda::thread_scope_block> bars[2];
+    extern __shared__ __align__(128) unsigned char smem_raw[];
+    unsigned char *smem_tiles_raw = smem_raw;
+    TmaBarrier *bars = reinterpret_cast<TmaBarrier *>(
+        smem_raw + kTmaStages * kTmaStageBytes);
     unsigned char *smem_tiles[2] = {
         smem_tiles_raw,
         smem_tiles_raw + kTmaStageBytes,

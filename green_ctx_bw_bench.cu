@@ -44,13 +44,27 @@ enum class LoadMode {
     CpAsync = 2,
     PipelineAsync = 3,
     Tma = 4,
+    DecodeLike = 5,
 };
 
-static constexpr size_t kTmaTileBytes = 16384;
 static constexpr size_t kTmaRowBytes = 256;
-static constexpr size_t kTmaRowsPerTile = kTmaTileBytes / kTmaRowBytes;
+static constexpr size_t kTmaTransferBytes = 16384;
+static constexpr size_t kTmaStageBytes = 32768;
+static constexpr size_t kTmaStages = 2;
+static constexpr size_t kTmaTransfersPerStage = kTmaStageBytes / kTmaTransferBytes;
+static constexpr size_t kTmaRowsPerTransfer = kTmaTransferBytes / kTmaRowBytes;
+static constexpr size_t kTmaRowsPerStage = kTmaStageBytes / kTmaRowBytes;
 static constexpr size_t kTmaFloat4sPerRow = kTmaRowBytes / sizeof(float4);
-static constexpr size_t kTmaTileFloat4s = kTmaTileBytes / sizeof(float4);
+static constexpr size_t kTmaStageFloat4s = kTmaStageBytes / sizeof(float4);
+static constexpr size_t kTmaDynamicSmemBytes = kTmaStages * kTmaStageBytes;
+static_assert(kTmaTransferBytes <= 16384, "A single TMA transfer cannot exceed 16 KiB");
+static_assert(kTmaStageBytes % kTmaTransferBytes == 0,
+              "A TMA stage must contain whole transfers");
+static_assert(kTmaTransferBytes % kTmaRowBytes == 0,
+              "A TMA transfer must contain whole rows");
+static constexpr size_t kDecodeTileBytes = 4096;
+static constexpr size_t kDecodeTileFloat4s = kDecodeTileBytes / sizeof(float4);
+static constexpr size_t kDecodeKvFloat4s = kDecodeTileFloat4s / 2;
 
 static LoadMode g_load_mode = LoadMode::Default;
 
@@ -211,11 +225,15 @@ read_bandwidth_kernel_tma(const float4 *__restrict__ src,
                           const CUtensorMap *tensor_map)
 {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-    __shared__ alignas(16) unsigned char smem_tiles[2][kTmaTileBytes];
+    extern __shared__ __align__(16) unsigned char smem_tiles_raw[];
     __shared__ cuda::barrier<cuda::thread_scope_block> bars[2];
+    unsigned char *smem_tiles[2] = {
+        smem_tiles_raw,
+        smem_tiles_raw + kTmaStageBytes,
+    };
     float4 *tiles[2] = {
-        reinterpret_cast<float4 *>(smem_tiles[0]),
-        reinterpret_cast<float4 *>(smem_tiles[1]),
+        reinterpret_cast<float4 *>(smem_tiles_raw),
+        reinterpret_cast<float4 *>(smem_tiles_raw + kTmaStageBytes),
     };
 
     if (threadIdx.x == 0) {
@@ -225,8 +243,8 @@ read_bandwidth_kernel_tma(const float4 *__restrict__ src,
     __syncthreads();
 
     float4 accum = make_float4(0.f, 0.f, 0.f, 0.f);
-    const size_t tile_bytes = kTmaTileBytes;
-    const size_t tile_rows = kTmaRowsPerTile;
+    const size_t tile_bytes = kTmaStageBytes;
+    const size_t tile_rows = kTmaRowsPerStage;
     const size_t float4s_per_row = kTmaFloat4sPerRow;
     const size_t tile_stride_rows = (size_t)gridDim.x * tile_rows;
     cuda::barrier<cuda::thread_scope_block>::arrival_token pending_token;
@@ -234,8 +252,15 @@ read_bandwidth_kernel_tma(const float4 *__restrict__ src,
 
     auto issue_tile = [&](int stage, size_t tile_row) {
         auto token = cuda::device::barrier_arrive_tx(bars[stage], 1, tile_bytes);
-        cuda::device::experimental::cp_async_bulk_tensor_2d_global_to_shared(
-            smem_tiles[stage], tensor_map, 0, static_cast<int>(tile_row), bars[stage]);
+        #pragma unroll
+        for (int transfer = 0; transfer < kTmaTransfersPerStage; ++transfer) {
+            cuda::device::experimental::cp_async_bulk_tensor_2d_global_to_shared(
+                smem_tiles[stage] + transfer * kTmaTransferBytes,
+                tensor_map,
+                0,
+                static_cast<int>(tile_row + transfer * kTmaRowsPerTransfer),
+                bars[stage]);
+        }
         return token;
     };
 
@@ -259,7 +284,7 @@ read_bandwidth_kernel_tma(const float4 *__restrict__ src,
 
         __syncthreads();
 
-        for (size_t i = threadIdx.x; i < kTmaTileFloat4s; i += blockDim.x) {
+        for (size_t i = threadIdx.x; i < kTmaStageFloat4s; i += blockDim.x) {
             size_t global_float4 = tile_row * float4s_per_row + i;
             if (global_float4 < n_float4) {
                 float4 v = tiles[stage][i];
@@ -293,6 +318,41 @@ read_bandwidth_kernel_tma(const float4 *__restrict__ src,
     (void)n_float4;
     (void)tensor_map;
 #endif
+}
+
+__global__ void __launch_bounds__(256)
+read_bandwidth_kernel_decode_like(const float4 *__restrict__ src,
+                                  float *__restrict__ sink,
+                                  size_t n_float4)
+{
+    const size_t tid = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    const size_t stride = (size_t)blockDim.x * gridDim.x;
+    const size_t token_count = n_float4 / kDecodeTileFloat4s;
+
+    float accum = 0.0f;
+    const float q_scale = 1.0f + 0.01f * static_cast<float>(blockIdx.x & 31);
+
+    for (size_t token = blockIdx.x; token < token_count; token += gridDim.x) {
+        const size_t token_base = token * kDecodeTileFloat4s;
+        float token_accum = 0.0f;
+
+        // Lightweight attention-like KV-cache sweep: read K and V halves,
+        // apply a tiny per-block scale, and keep the math cheap so bandwidth
+        // remains the bottleneck.
+        for (size_t i = threadIdx.x; i < kDecodeKvFloat4s; i += blockDim.x) {
+            float4 k = __ldg(&src[token_base + i]);
+            float4 v = __ldg(&src[token_base + kDecodeKvFloat4s + i]);
+            float k_sum = k.x + k.y + k.z + k.w;
+            float v_sum = v.x + v.y + v.z + v.w;
+            token_accum += k_sum * q_scale + v_sum * 0.125f;
+        }
+
+        accum += token_accum;
+    }
+
+    if (tid < stride) {
+        sink[tid] = accum;
+    }
 }
 
 __global__ void __launch_bounds__(256)
@@ -342,6 +402,7 @@ static const char *load_mode_name(LoadMode mode)
     case LoadMode::CpAsync: return "cp.async staging";
     case LoadMode::PipelineAsync: return "pipeline async staging";
     case LoadMode::Tma: return "TMA (cp.async.bulk.tensor)";
+    case LoadMode::DecodeLike: return "Decode-like KV-cache sweep";
     }
     return "Unknown";
 }
@@ -354,6 +415,11 @@ static bool uses_shared_staging(LoadMode mode)
 static bool uses_tma(LoadMode mode)
 {
     return mode == LoadMode::Tma;
+}
+
+static bool uses_decode_like(LoadMode mode)
+{
+    return mode == LoadMode::DecodeLike;
 }
 
 static bool build_tma_context(CUdevice cuDev, const float4 *d_src, size_t buf_bytes,
@@ -369,7 +435,7 @@ static bool build_tma_context(CUdevice cuDev, const float4 *d_src, size_t buf_by
     CUtensorMap host_map{};
     const cuuint64_t global_dim[2]     = { kTmaRowBytes, buf_bytes / kTmaRowBytes };
     const cuuint64_t global_strides[1] = { kTmaRowBytes };            // dim1 간 stride = 256 bytes
-    const cuuint32_t box_dim[2]        = { kTmaRowBytes, kTmaRowsPerTile };  // {256, 64}
+    const cuuint32_t box_dim[2]        = { kTmaRowBytes, kTmaRowsPerTransfer };  // {256, 64}
     const cuuint32_t element_strides[2] = { 1, 1 };
 
     CUDA_DRIVER_CHECK(cuTensorMapEncodeTiled(&host_map,
@@ -417,7 +483,11 @@ static void launch_selected_kernel(const float4 *d_src, float *d_sink,
         read_bandwidth_kernel_pipeline<<<blocks, threads, shared_bytes, stream>>>(d_src, d_sink, n_float4);
         break;
     case LoadMode::Tma:
-        read_bandwidth_kernel_tma<<<blocks, 256, 0, stream>>>(d_src, d_sink, n_float4, tma_ctx.d_tensor_map);
+        read_bandwidth_kernel_tma<<<blocks, 256, kTmaDynamicSmemBytes, stream>>>(
+            d_src, d_sink, n_float4, tma_ctx.d_tensor_map);
+        break;
+    case LoadMode::DecodeLike:
+        read_bandwidth_kernel_decode_like<<<blocks, threads, 0, stream>>>(d_src, d_sink, n_float4);
         break;
     }
 }
@@ -548,7 +618,7 @@ int main(int argc, char **argv)
     int    sm_step  = (argc > 4) ? atoi(argv[4]) : 0;     // 0 = auto
     int    trials   = (argc > 5) ? atoi(argv[5]) : 5;     // median of N trials
     int    mode     = (argc > 6) ? atoi(argv[6]) : 0;
-    g_load_mode = static_cast<LoadMode>(std::max(0, std::min(mode, 4)));
+    g_load_mode = static_cast<LoadMode>(std::max(0, std::min(mode, 5)));
 
     // ---- Initialize CUDA Driver API ----
     CUDA_DRIVER_CHECK(cuInit(0));
@@ -627,6 +697,22 @@ int main(int argc, char **argv)
             fprintf(stderr, "TMA mode requires SM90+; this GPU is %d.%d\n", cc_major, cc_minor);
             return EXIT_FAILURE;
         }
+        int max_optin_smem = 0;
+        CUDA_RT_CHECK(cudaDeviceGetAttribute(
+            &max_optin_smem, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev_id));
+        if (kTmaDynamicSmemBytes > static_cast<size_t>(max_optin_smem)) {
+            fprintf(stderr,
+                    "TMA mode requires %zu bytes of dynamic shared memory, "
+                    "but this GPU supports at most %d bytes per block\n",
+                    kTmaDynamicSmemBytes, max_optin_smem);
+            return EXIT_FAILURE;
+        }
+        CUDA_RT_CHECK(cudaFuncSetAttribute(
+            read_bandwidth_kernel_tma,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            static_cast<int>(kTmaDynamicSmemBytes)));
+        fprintf(stderr, "TMA Stage:       %zu KiB x %zu buffers (%zu KiB dynamic shared)\n",
+                kTmaStageBytes / 1024, kTmaStages, kTmaDynamicSmemBytes / 1024);
         if (!build_tma_context(cuDev, d_src, buf_bytes, &tma_ctx)) {
             fprintf(stderr, "Failed to build TMA tensor map\n");
             return EXIT_FAILURE;

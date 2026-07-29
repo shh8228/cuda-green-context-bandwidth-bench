@@ -68,7 +68,7 @@ bash run_bench.sh 512 20 0 0
 | `gpu_id` | 0 | CUDA device index. |
 | `sm_step` | 0 (auto) | SM count step size. 0 = use architecture granularity. |
 | `trials` | 5 | Number of independent trials; reports median. |
-| `load_mode` | 0 | 0 = default `__ldg`, 1 = L1-bypass (`ld.global.cg`), 2 = `cp.async` staging, 3 = cooperative-groups async staging, 4 = TMA (`cp.async.bulk.tensor`, SM90+ only). |
+| `load_mode` | 0 | 0 = default `__ldg`, 1 = L1-bypass (`ld.global.cg`), 2 = `cp.async` staging, 3 = cooperative-groups async staging, 4 = TMA (`cp.async.bulk.tensor`, SM90+ only), 5 = decode-like KV-cache sweep. |
 
 ### Load Modes
 
@@ -77,6 +77,7 @@ bash run_bench.sh 512 20 0 0
 - `2`: Explicit `cp.async` shared-memory staging.
 - `3`: Cooperative-groups async staging path, useful as the closest portable precursor to Hopper/Blackwell-style async copy flows.
 - `4`: Hopper/Blackwell TMA path using a 2D tensor map and `cp.async.bulk.tensor.2d`.
+- `5`: Lightweight transformer-decode-style KV-cache sweep that scans each token as K/V tiles and keeps the arithmetic intentionally small so memory bandwidth stays dominant.
 
 Note: `load_mode=4` requires compute capability 9.0 or higher.
 

@@ -422,11 +422,6 @@ static bool uses_tma(LoadMode mode)
     return mode == LoadMode::Tma;
 }
 
-static bool uses_decode_like(LoadMode mode)
-{
-    return mode == LoadMode::DecodeLike;
-}
-
 static bool build_tma_context(CUdevice cuDev, const float4 *d_src, size_t buf_bytes,
                               TmaContext *tma_ctx)
 {
@@ -565,6 +560,53 @@ static double measure_bandwidth_default(const float4 *d_src, float *d_sink,
 }
 
 // ---------------------------------------------------------------------------
+// Probe which SM IDs actually execute work under an externally supplied mask.
+// Keep many blocks resident briefly so every enabled SM gets an opportunity.
+// ---------------------------------------------------------------------------
+__global__ void smid_residency_probe(unsigned int *block_counts,
+                                     unsigned int block_counts_size)
+{
+    unsigned int smid = 0;
+    asm volatile("mov.u32 %0, %%smid;" : "=r"(smid));
+
+    if (threadIdx.x == 0) {
+        if (smid < block_counts_size)
+            atomicAdd(&block_counts[smid], 1U);
+
+        const unsigned long long start = clock64();
+        while (clock64() - start < 100000ULL) {
+            asm volatile("");
+        }
+    }
+}
+
+static std::vector<unsigned int> observe_sm_residency(unsigned int total_sms)
+{
+    constexpr unsigned int kMaxReportedSmId = 4096;
+    unsigned int *d_counts = nullptr;
+    CUDA_RT_CHECK(cudaMalloc(&d_counts, kMaxReportedSmId * sizeof(unsigned int)));
+    CUDA_RT_CHECK(cudaMemset(d_counts, 0, kMaxReportedSmId * sizeof(unsigned int)));
+
+    const unsigned int blocks = std::max(256U, total_sms * 32U);
+    smid_residency_probe<<<blocks, 32>>>(d_counts, kMaxReportedSmId);
+    CUDA_RT_CHECK(cudaGetLastError());
+    CUDA_RT_CHECK(cudaDeviceSynchronize());
+
+    std::vector<unsigned int> counts(kMaxReportedSmId);
+    CUDA_RT_CHECK(cudaMemcpy(counts.data(), d_counts,
+                             kMaxReportedSmId * sizeof(unsigned int),
+                             cudaMemcpyDeviceToHost));
+    CUDA_RT_CHECK(cudaFree(d_counts));
+
+    std::vector<unsigned int> observed;
+    for (unsigned int smid = 0; smid < kMaxReportedSmId; ++smid) {
+        if (counts[smid] != 0)
+            observed.push_back(smid);
+    }
+    return observed;
+}
+
+// ---------------------------------------------------------------------------
 // Measure bandwidth inside a Green Context with a given SM partition
 // ---------------------------------------------------------------------------
 static double measure_bandwidth_green_ctx(CUdevice cuDev,
@@ -614,15 +656,82 @@ static double measure_bandwidth_green_ctx(CUdevice cuDev,
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
+static void print_usage(const char *program)
+{
+    printf("Usage:\n");
+    printf("  %s [buffer_MB] [iterations] [gpu_id] [sm_step] [trials] [load_mode]\n", program);
+    printf("  %s --external-single [buffer_MB] [iterations] [gpu_id] [trials] [load_mode]\n", program);
+    printf("  %s --external-probe [gpu_id]\n", program);
+    printf("\n--external-single runs one ordinary-context measurement so an external\n");
+    printf("TPC-mask tool such as nvtaskset can control physical placement.\n");
+    printf("--external-probe reports only SM residency and does not allocate the read buffer.\n");
+}
+
+static void print_external_usage(const char *program)
+{
+    printf("Usage: %s --external-single [buffer_MB] [iterations] [gpu_id] [trials] [load_mode]\n", program);
+    printf("Runs one ordinary-context measurement under an externally applied TPC mask.\n");
+    printf("stdout contains one external_single JSON record with bandwidth_GBps,\n");
+    printf("observed_sm_count, and observed_sm_ids. Diagnostics go to stderr.\n");
+}
+
+static void print_external_probe_usage(const char *program)
+{
+    printf("Usage: %s --external-probe [gpu_id]\n", program);
+    printf("Runs only the SM-residency probe under an externally applied TPC mask.\n");
+    printf("stdout contains one external_probe JSON record with total_sm_count,\n");
+    printf("observed_sm_count, and observed_sm_ids. Diagnostics go to stderr.\n");
+}
+
 int main(int argc, char **argv)
 {
+    if (argc > 1 && (strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0)) {
+        print_usage(argv[0]);
+        return 0;
+    }
+
+    const bool external_single = argc > 1 && strcmp(argv[1], "--external-single") == 0;
+    const bool external_probe = argc > 1 && strcmp(argv[1], "--external-probe") == 0;
+    if (external_single && argc > 2 &&
+        (strcmp(argv[2], "--help") == 0 || strcmp(argv[2], "-h") == 0)) {
+        print_external_usage(argv[0]);
+        return 0;
+    }
+    if (external_probe && argc > 2 &&
+        (strcmp(argv[2], "--help") == 0 || strcmp(argv[2], "-h") == 0)) {
+        print_external_probe_usage(argv[0]);
+        return 0;
+    }
+
     // ---- Parse arguments ----
-    size_t buf_mb   = (argc > 1) ? atol(argv[1]) : 512;   // default 512 MB
-    int    iters    = (argc > 2) ? atoi(argv[2]) : 20;
-    int    dev_id   = (argc > 3) ? atoi(argv[3]) : 0;
-    int    sm_step  = (argc > 4) ? atoi(argv[4]) : 0;     // 0 = auto
-    int    trials   = (argc > 5) ? atoi(argv[5]) : 5;     // median of N trials
-    int    mode     = (argc > 6) ? atoi(argv[6]) : 0;
+    size_t buf_mb;
+    int iters, dev_id, sm_step, trials, mode;
+    if (external_probe) {
+        buf_mb = 0;
+        iters = 1;
+        dev_id = (argc > 2) ? atoi(argv[2]) : 0;
+        trials = 1;
+        mode = 1;
+        sm_step = 0;
+    } else if (external_single) {
+        buf_mb = (argc > 2) ? atol(argv[2]) : 512;
+        iters  = (argc > 3) ? atoi(argv[3]) : 20;
+        dev_id = (argc > 4) ? atoi(argv[4]) : 0;
+        trials = (argc > 5) ? atoi(argv[5]) : 5;
+        mode   = (argc > 6) ? atoi(argv[6]) : 1;
+        sm_step = 0;
+    } else {
+        buf_mb = (argc > 1) ? atol(argv[1]) : 512;
+        iters  = (argc > 2) ? atoi(argv[2]) : 20;
+        dev_id = (argc > 3) ? atoi(argv[3]) : 0;
+        sm_step = (argc > 4) ? atoi(argv[4]) : 0;
+        trials = (argc > 5) ? atoi(argv[5]) : 5;
+        mode   = (argc > 6) ? atoi(argv[6]) : 0;
+    }
+    if (!external_probe && (buf_mb == 0 || iters <= 0 || trials <= 0)) {
+        fprintf(stderr, "buffer_MB, iterations, and trials must be positive\n");
+        return EXIT_FAILURE;
+    }
     g_load_mode = static_cast<LoadMode>(std::max(0, std::min(mode, 5)));
 
     // ---- Initialize CUDA Driver API ----
@@ -650,14 +759,41 @@ int main(int argc, char **argv)
                                               CU_DEV_RESOURCE_TYPE_SM));
     unsigned int totalSMs = totalSmRes.sm.smCount;
 
-    fprintf(stderr, "=== Green Context Bandwidth Saturation Benchmark ===\n");
+    const char *benchmark_name = external_probe
+        ? "External-mask SM Residency Probe"
+        : (external_single
+            ? "External-mask DRAM Bandwidth Measurement"
+            : "Green Context Bandwidth Saturation Benchmark");
+    fprintf(stderr, "=== %s ===\n", benchmark_name);
     fprintf(stderr, "GPU:             %s\n", devName);
     fprintf(stderr, "Compute Cap:     %d.%d\n", cc_major, cc_minor);
     fprintf(stderr, "Total SMs:       %u\n", totalSMs);
-    fprintf(stderr, "Buffer Size:     %zu MB\n", buf_mb);
-    fprintf(stderr, "Iterations:      %d (per trial)\n", iters);
-    fprintf(stderr, "Trials:          %d (median)\n", trials);
-    fprintf(stderr, "Load Mode:       %s\n", load_mode_name(g_load_mode));
+    if (!external_probe) {
+        fprintf(stderr, "Buffer Size:     %zu MB\n", buf_mb);
+        fprintf(stderr, "Iterations:      %d (per trial)\n", iters);
+        fprintf(stderr, "Trials:          %d (median)\n", trials);
+        fprintf(stderr, "Load Mode:       %s\n", load_mode_name(g_load_mode));
+    }
+
+    if (external_probe) {
+        const std::vector<unsigned int> observed_sms = observe_sm_residency(totalSMs);
+        if (observed_sms.empty()) {
+            fprintf(stderr, "SM-residency probe observed no active SMs\n");
+            return EXIT_FAILURE;
+        }
+        fprintf(stderr, "Observed SMs:    %zu\n", observed_sms.size());
+        printf("{\"kind\":\"external_probe\",\"total_sm_count\":%u,"
+               "\"observed_sm_count\":%zu,\"observed_sm_ids\":[",
+               totalSMs, observed_sms.size());
+        for (size_t i = 0; i < observed_sms.size(); ++i) {
+            if (i != 0)
+                printf(",");
+            printf("%u", observed_sms[i]);
+        }
+        printf("]}\n");
+        fflush(stdout);
+        return 0;
+    }
 
     // Determine SM granularity for this architecture
     // Blackwell (10.x) / Hopper (9.x): 8 SM granularity
@@ -722,6 +858,36 @@ int main(int argc, char **argv)
             fprintf(stderr, "Failed to build TMA tensor map\n");
             return EXIT_FAILURE;
         }
+    }
+
+    if (external_single) {
+        const double bw = measure_bandwidth_default(d_src, d_sink, n_float4,
+                                                     totalSMs, iters, trials,
+                                                     buf_bytes, tma_ctx);
+        const std::vector<unsigned int> observed_sms = observe_sm_residency(totalSMs);
+        if (observed_sms.empty()) {
+            fprintf(stderr, "SM-residency probe observed no active SMs\n");
+            return EXIT_FAILURE;
+        }
+
+        fprintf(stderr, "Observed SMs:    %zu\n", observed_sms.size());
+        fprintf(stderr, "Bandwidth:       %.3f GB/s\n", bw);
+        printf("{\"kind\":\"external_single\",\"bandwidth_GBps\":%.6f,"
+               "\"observed_sm_count\":%zu,\"observed_sm_ids\":[",
+               bw, observed_sms.size());
+        for (size_t i = 0; i < observed_sms.size(); ++i) {
+            if (i != 0)
+                printf(",");
+            printf("%u", observed_sms[i]);
+        }
+        printf("]}\n");
+        fflush(stdout);
+
+        if (tma_ctx.enabled && tma_ctx.d_tensor_map != nullptr)
+            CUDA_RT_CHECK(cudaFree(tma_ctx.d_tensor_map));
+        CUDA_RT_CHECK(cudaFree(d_src));
+        CUDA_RT_CHECK(cudaFree(d_sink));
+        return 0;
     }
 
     // ---- Baseline: full-GPU bandwidth ----

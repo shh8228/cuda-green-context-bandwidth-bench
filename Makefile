@@ -10,7 +10,7 @@ LDFLAGS    := -lcuda
 TARGET     := green_ctx_bw_bench
 SRC        := green_ctx_bw_bench.cu
 
-.PHONY: all clean run plot
+.PHONY: all clean run plot test
 
 all: $(TARGET)
 
@@ -28,6 +28,9 @@ run-large: $(TARGET)
 # Generate plot from results
 plot: results.csv
 	python3 plot_results.py results.csv
+
+test: $(TARGET)
+	python3 -m unittest discover -s tests -v
 
 clean:
 	rm -f $(TARGET) results.csv *.png

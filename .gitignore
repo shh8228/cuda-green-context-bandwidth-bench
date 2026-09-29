@@ -13,3 +13,7 @@ bw_saturation.png
 .vscode/
 *.swp
 *~
+
+# Python
+__pycache__/
+*.pyc

@@ -4,17 +4,23 @@
 
 NVCC       ?= nvcc
 CUDA_ARCH  ?= sm_100
-NVCC_FLAGS := -O3 -std=c++17 -arch=$(CUDA_ARCH) --expt-relaxed-constexpr
-LDFLAGS    := -lcuda
+CUDA_ROOT  ?= $(abspath $(dir $(shell command -v $(NVCC)))/..)
+NVCC_FLAGS := -O3 -lineinfo -std=c++17 -arch=$(CUDA_ARCH) --expt-relaxed-constexpr
+# Development containers often expose libcuda.so.1 without the linker symlink.
+# Stubs are for linking only; never add their directory to the runtime rpath.
+LDFLAGS    := -L$(CUDA_ROOT)/lib64/stubs -L$(CUDA_ROOT)/lib/stubs -lcuda
 
 TARGET     := green_ctx_bw_bench
 SRC        := green_ctx_bw_bench.cu
 
-.PHONY: all clean run plot test
+.PHONY: all clean run run-large plot test test-gpu FORCE
 
 all: $(TARGET)
 
-$(TARGET): $(SRC)
+# Flags/architectures may change without a source timestamp change.
+FORCE:
+
+$(TARGET): $(SRC) bench_options.h Makefile FORCE
 	$(NVCC) $(NVCC_FLAGS) $< -o $@ $(LDFLAGS)
 
 # Default run: 512MB buffer, 20 iterations, GPU 0, auto SM step
@@ -30,7 +36,10 @@ plot: results.csv
 	python3 plot_results.py results.csv
 
 test: $(TARGET)
-	python3 -m unittest discover -s tests -v
+	BENCHMARK_BINARY=$(abspath $(TARGET)) python3 -m unittest discover -s tests -v
+
+test-gpu: $(TARGET)
+	RUN_CUDA_TESTS=1 BENCHMARK_BINARY=$(abspath $(TARGET)) python3 -m unittest discover -s tests -v
 
 clean:
 	rm -f $(TARGET) results.csv *.png

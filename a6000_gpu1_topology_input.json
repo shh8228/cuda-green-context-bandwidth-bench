@@ -1,0 +1,25 @@
+{
+  "gpu_id": 1,
+  "raw_libsmctrl_output": "libsmctrl_test_gpc_info: GPU1 has 7 enabled GPCs.\nlibsmctrl_test_gpc_info: Mask of 6 TPCs associated with GPC 0: 0x00810204081\nlibsmctrl_test_gpc_info: Mask of 6 TPCs associated with GPC 1: 0x01020408102\nlibsmctrl_test_gpc_info: Mask of 6 TPCs associated with GPC 2: 0x02040810204\nlibsmctrl_test_gpc_info: Mask of 6 TPCs associated with GPC 3: 0x04081020408\nlibsmctrl_test_gpc_info: Mask of 6 TPCs associated with GPC 4: 0x08102040810\nlibsmctrl_test_gpc_info: Mask of 6 TPCs associated with GPC 5: 0x10204081020\nlibsmctrl_test_gpc_info: Mask of 6 TPCs associated with GPC 6: 0x20408102040\nlibsmctrl_test_gpc_info: Total of 42 enabled TPCs.\n",
+  "topology": {
+    "0": [0, 7, 14, 21, 28, 35],
+    "1": [1, 8, 15, 22, 29, 36],
+    "2": [2, 9, 16, 23, 30, 37],
+    "3": [3, 10, 17, 24, 31, 38],
+    "4": [4, 11, 18, 25, 32, 39],
+    "5": [5, 12, 19, 26, 33, 40],
+    "6": [6, 13, 20, 27, 34, 41]
+  },
+  "topology_notes": [
+    "Captured from libsmctrl_test_gpc_info 1 with CUDA_DEVICE_ORDER=PCI_BUS_ID.",
+    "nvdebug must be unloaded before running nvtaskset/MPS on this host.",
+    "Raw TPC indices are physically interleaved across GPCs."
+  ]
+}
+
+
+
+
+
+
+

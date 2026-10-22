@@ -17,3 +17,7 @@ bw_saturation.png
 # Python
 __pycache__/
 *.pyc
+
+# B200 Runpod artifacts
+b200_results/
+b200_runpod_bundle.tar.gz

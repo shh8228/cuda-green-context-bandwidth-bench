@@ -1,5 +1,6 @@
 import json
 import csv
+import os
 import subprocess
 import tempfile
 import unittest
@@ -276,7 +277,7 @@ class ExperimentPlanningTests(unittest.TestCase):
 
 class CliContractTests(unittest.TestCase):
     def test_help_documents_external_single_mode_without_requiring_a_gpu(self):
-        binary = ROOT / "green_ctx_bw_bench"
+        binary = Path(os.environ.get("BENCHMARK_BINARY", ROOT / "green_ctx_bw_bench"))
         if not binary.exists():
             self.skipTest("build green_ctx_bw_bench before running the CLI contract test")
 
@@ -292,7 +293,7 @@ class CliContractTests(unittest.TestCase):
         self.assertIn("--external-single", result.stdout)
 
     def test_external_single_help_describes_machine_readable_output(self):
-        binary = ROOT / "green_ctx_bw_bench"
+        binary = Path(os.environ.get("BENCHMARK_BINARY", ROOT / "green_ctx_bw_bench"))
         if not binary.exists():
             self.skipTest("build green_ctx_bw_bench before running the CLI contract test")
 
@@ -309,7 +310,7 @@ class CliContractTests(unittest.TestCase):
         self.assertIn("observed_sm_ids", result.stdout)
 
     def test_external_probe_help_describes_residency_only_mode(self):
-        binary = ROOT / "green_ctx_bw_bench"
+        binary = Path(os.environ.get("BENCHMARK_BINARY", ROOT / "green_ctx_bw_bench"))
         if not binary.exists():
             self.skipTest("build green_ctx_bw_bench before running the CLI contract test")
 

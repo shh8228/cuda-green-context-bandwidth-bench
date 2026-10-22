@@ -1,6 +1,46 @@
 # Green Context DRAM Bandwidth Saturation Benchmark
 
-Microbenchmark to empirically determine the **minimum number of SMs required to saturate GPU DRAM read bandwidth** using CUDA Green Contexts, targeting NVIDIA Blackwell (GB200).
+Measure streaming-read bandwidth versus allocated SM count using CUDA Green Contexts on NVIDIA B200/GB200. The reported saturation point is the smallest sampled allocation reaching 95% of the full-GPU baseline for the selected kernel and configuration. Verify physical DRAM traffic with Nsight before interpreting it as a hardware limit.
+
+## B200 on Runpod
+
+Select a **B200** pod and a **CUDA development template with `nvcc` 12.8 or newer**. The CUDA version displayed by `nvidia-smi` describes driver compatibility; check `nvcc --version` for the actual compiler. Runpod's [CUDA 12.8 development template guide](https://www.runpod.io/articles/guides/pytorch-2-8-cuda-12-8) and NVIDIA's [Blackwell compatibility guide](https://docs.nvidia.com/cuda/archive/12.8.1/blackwell-compatibility-guide/index.html) describe compatible environments.
+
+Copy or clone this project into the pod, then run from its directory:
+
+```bash
+python3 run_b200_runpod.py --preflight-only
+python3 run_b200_runpod.py
+```
+
+The default run uses a 2 GiB input and compares direct L1-bypass loads (mode 1) with TMA (mode 4), with 8 and 32 queued blocks per SM and TMA depths of 2, 4, and 8. It compiles a fresh native `sm_100` executable inside a new results directory, pins the selected GPU by UUID, validates every load mode, then sweeps the supported SM allocations in randomized order. It repeats the full-GPU baseline afterward to reveal drift. Correctness checks also run inside each green context before timing.
+
+For a shorter first run, or for the full validation tools:
+
+```bash
+# One TMA configuration
+python3 run_b200_runpod.py --modes 4 --blocks-per-sm 8 --tma-stages 4
+
+# Additional device instrumentation; requires matching Compute Sanitizer and ncu
+python3 run_b200_runpod.py --sanitize --profile
+
+# Select an NVML device index/UUID, buffer size, and a NEW output directory
+python3 run_b200_runpod.py --gpu-id 0 --buffer-mb 4096 --output-dir /workspace/b200-run-1
+```
+
+`--sanitize` runs memcheck, racecheck, and synccheck on the built-in correctness cases before timing. `--profile` separately collects actual DRAM read/write bytes, kernel duration, and DRAM throughput at 8 SMs, the measured 95% point, and the full GPU for each configuration. Profiling requires permission to access performance counters on the Runpod host; `ERR_NVGPUCTRPERM` must be resolved by the host/provider. Profiler event timings are kept separate from ordinary benchmark timings.
+
+Artifacts are saved under `b200_results/<UTC timestamp>/`, or `--output-dir`:
+
+- A fresh executable and copies/hashes of its source inputs.
+- `manifest.json` with GPU UUID, driver/toolkit versions, arguments, commands, exit codes, and completion status.
+- One bandwidth CSV and plot per configuration. Plotting needs `matplotlib` and `numpy`; CSV and text analysis work without them.
+- Logs with correctness results, per-trial timings, compiled PTX target, register/shared-memory use, theoretical occupancy, residency probe counts, and baseline drift.
+- Optional sanitizer logs and Nsight CSV files in base units.
+
+An error stops the runner and leaves `complete: false` in the manifest. The built-in checks cover all output threads, partial tiles, idle CTAs, and repeated TMA barrier phases using varied integer input and a CPU reference. These checks do not replace running the sanitizer suite on the actual GPU.
+
+A separate residency probe reports the SMs available to a context; it does not instrument the timed kernel or prove that every allocated SM was busy throughout it. Compare absolute bandwidth as well as each configuration's own 95% threshold. The L2-size check (input >= 4x L2) reduces cache contamination but does not prove that the counted bytes reached DRAM; use the profiler's `dram__bytes_read.sum` for that check.
 
 ## Motivation
 
@@ -8,12 +48,12 @@ When spatially partitioning a GPU with CUDA Green Contexts (e.g., for disaggrega
 
 ## How It Works
 
-1. **Baseline**: Measures full-GPU DRAM read bandwidth using all SMs.
+1. **Baseline**: Measures full-GPU effective read bandwidth for the selected kernel.
 2. **Sweep**: For each SM count from the architecture minimum up to the total:
    - Creates a **Green Context** with that many SMs via `cuDevSmResourceSplitByCount` + `cuGreenCtxCreate`.
    - Launches a pure streaming-read kernel (`__ldg` float4 loads, coalesced access pattern) confined to the Green Context.
    - Measures achieved read bandwidth using CUDA events, taking the **median of multiple trials** for robustness.
-3. **Analysis**: Identifies the saturation point — the smallest SM count achieving ≥95% of full-GPU bandwidth.
+3. **Analysis**: Identifies the smallest sampled SM allocation achieving ≥95% of that kernel/configuration’s full-GPU bandwidth.
 
 ### SM Granularity by Architecture
 
@@ -29,7 +69,7 @@ The benchmark auto-detects the architecture and uses the correct granularity.
 
 ## Prerequisites
 
-- **Container**: `runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404` (or any environment with CUDA ≥ 12.4 and `nvcc`)
+- **Compiler**: CUDA ≥ 12.8 for native B200/GB200 (`sm_100`); CUDA ≥ 12.4 for older supported targets. Use a development image with `nvcc`, a host C++ compiler, and `make`.
 - **GPU**: NVIDIA Blackwell GB200 (also works on Hopper, Ampere, etc.)
 - **Python 3** with `matplotlib` (for plotting; analysis text output works without it)
 
@@ -40,8 +80,8 @@ The benchmark auto-detects the architecture and uses the correct granularity.
 make
 
 # For other architectures:
-make CUDA_ARCH=sm_90a   # Hopper
-make CUDA_ARCH=sm_86    # Ampere (A6000, A100, etc.)
+make -B CUDA_ARCH=sm_90   # Hopper
+make -B CUDA_ARCH=sm_86   # RTX A6000 (use sm_80 for A100)
 ```
 
 ## Run
@@ -63,10 +103,10 @@ bash run_bench.sh 512 20 0 0
 
 | Argument | Default | Description |
 |---|---|---|
-| `buffer_MB` | 512 | Size of the read buffer in MB. Larger = more stable results. |
+| `buffer_MB` | 512 | Size of the read buffer in MiB. Use a size well above L2 capacity. |
 | `iterations` | 20 | Kernel launches per timed trial. |
 | `gpu_id` | 0 | CUDA device index. |
-| `sm_step` | 0 (auto) | SM count step size. 0 = use architecture granularity. |
+| `sm_step` | 0 (auto) | SM count step size. 0 = use the supported alignment (2 on Ampere, 8 on Hopper/B200). |
 | `trials` | 5 | Number of independent trials; reports median. |
 | `load_mode` | 0 | 0 = default `__ldg`, 1 = L1-bypass (`ld.global.cg`), 2 = `cp.async` staging, 3 = cooperative-groups async staging, 4 = TMA (`cp.async.bulk.tensor`, SM90+ only), 5 = decode-like KV-cache sweep. |
 
@@ -79,7 +119,19 @@ bash run_bench.sh 512 20 0 0
 - `4`: Hopper/Blackwell TMA path using a 2D tensor map and `cp.async.bulk.tensor.2d`.
 - `5`: Lightweight transformer-decode-style KV-cache sweep that scans each token as K/V tiles and keeps the arithmetic intentionally small so memory bandwidth stays dominant.
 
-Note: `load_mode=4` requires compute capability 9.0 or higher.
+Note: mode 4 requires both GPU and compiled PTX target >= SM90; mode 2 requires >= SM80. Unsupported builds fail instead of executing a no-op. TMA uses 16 KiB tiles with configurable pipeline depth, 128-byte-aligned shared memory, explicitly published barrier initialization, and protected buffer reuse.
+
+Additional options work with the positional CLI:
+
+```bash
+./green_ctx_bw_bench --validate-only 1 1 0 0 1 4
+./green_ctx_bw_bench --tma-stages 4 --blocks-per-sm 8 --require-dram 2048 30 0 0 7 4
+./green_ctx_bw_bench --sm-count 8 --tma-stages 4 2048 30 0 0 7 4
+make test CUDA_ARCH=sm_100
+make test-gpu CUDA_ARCH=sm_100
+```
+
+`--sm-count` emits one JSON measurement. `--skip-validation` is intended for profiling after successful correctness checks. The CSV retains the original four columns and adds `probe_observed_sm_count`. All diagnostic output goes to stderr.
 
 ### Example
 
@@ -290,7 +342,7 @@ sm_count_requested,sm_count_allocated,bandwidth_GBps,pct_of_full_gpu
 
 - **sm_count_requested**: The SM count passed to `cuDevSmResourceSplitByCount`.
 - **sm_count_allocated**: The actual SM count allocated (may be rounded up by the driver).
-- **bandwidth_GBps**: Measured DRAM read bandwidth in GB/s (median of trials).
+- **bandwidth_GBps**: Effective input read bandwidth in GB/s (median of trials); verify actual DRAM traffic with counters.
 - **pct_of_full_gpu**: Bandwidth as a percentage of the full-GPU baseline.
 
 ### Plot (`bw_saturation.png`)
@@ -328,6 +380,6 @@ green_ctx_bw_bench/
 ## Notes
 
 - The kernel uses `__ldg()` (read-only texture cache path) for streaming loads, which is the standard technique for bandwidth benchmarks.
-- Green Contexts may sometimes allow work to run on more SMs than provisioned (documented CUDA behavior), but the median-of-trials approach mitigates measurement noise from this.
-- Memory is allocated in the **primary context** and accessible from all Green Contexts on the same device (unified address space).
-- The benchmark measures **read-only** bandwidth. Write bandwidth saturation may differ.
+- Green Contexts can use extra SMs in specific documented MPS/CDP scenarios. The benchmark reports residency probes and rejects observed counts above the allocation; taking a median does not fix an incorrect SM-count assumption.
+- Memory is allocated in the **primary context**, which is shared by the converted Green Contexts on the same device.
+- The numerator counts input read bytes; kernels also write a small sink. Use profiler counters to distinguish effective read throughput from actual DRAM traffic.

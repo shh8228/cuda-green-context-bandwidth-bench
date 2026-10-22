@@ -4,7 +4,7 @@ plot_results.py — Visualize Green Context BW saturation benchmark results.
 
 Reads CSV output from green_ctx_bw_bench and produces:
   1. Bandwidth vs SM count plot
-  2. Annotated saturation point (95% of peak)
+  2. Annotated threshold point (95% of this configuration's full-GPU baseline)
 
 Usage:
     python3 plot_results.py results.csv [output.png]
@@ -124,9 +124,9 @@ def main():
                                edgecolor="#F44336", alpha=0.9))
 
     ax1.set_xlabel("Number of SMs (allocated)", fontsize=13)
-    ax1.set_ylabel("Read Bandwidth (GB/s)", fontsize=13)
-    ax1.set_title("DRAM Read BW Saturation vs. SM Count\n"
-                  "(CUDA Green Contexts)", fontsize=14, fontweight="bold")
+    ax1.set_ylabel("Effective Read Bandwidth (GB/s)", fontsize=13)
+    ax1.set_title("Effective Read BW vs. Allocated SMs\n"
+                  "(CUDA Green Contexts; configuration-specific baseline)", fontsize=14, fontweight="bold")
     ax1.legend(fontsize=11, loc="lower right")
     ax1.grid(True, alpha=0.3)
     ax1.set_xlim(left=0)

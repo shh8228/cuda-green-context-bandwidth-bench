@@ -1,36 +1,58 @@
 # Green Context DRAM Bandwidth Saturation Benchmark
 
-Measure streaming-read bandwidth versus allocated SM count using CUDA Green Contexts on NVIDIA B200/GB200. The reported saturation point is the smallest sampled allocation reaching 95% of the full-GPU baseline for the selected kernel and configuration. Verify physical DRAM traffic with Nsight before interpreting it as a hardware limit.
+Measure streaming-read bandwidth versus allocated SM count using CUDA Green Contexts on NVIDIA H200 and B200/GB200. The reported saturation point is the smallest sampled allocation reaching 95% of the full-GPU baseline for the selected kernel and configuration. Verify physical DRAM traffic with Nsight before interpreting it as a hardware limit.
 
-## B200 on Runpod
+## H200 or B200 on Runpod
 
-Select a **B200** pod and a **CUDA development template with `nvcc` 12.8 or newer**. The CUDA version displayed by `nvidia-smi` describes driver compatibility; check `nvcc --version` for the actual compiler. Runpod's [CUDA 12.8 development template guide](https://www.runpod.io/articles/guides/pytorch-2-8-cuda-12-8) and NVIDIA's [Blackwell compatibility guide](https://docs.nvidia.com/cuda/archive/12.8.1/blackwell-compatibility-guide/index.html) describe compatible environments.
+Select the GPU and a **CUDA development image containing `nvcc`, a C++ compiler, and `make`**:
 
-Copy or clone this project into the pod, then run from its directory:
+| GPU | Native build target | Minimum `nvcc` toolkit |
+|---|---|---|
+| H200 (including H200 NVL) | `sm_90` | CUDA 12.4 |
+| B200 / GB200 | `sm_100` | CUDA 12.8 |
+
+NVIDIA lists [H200 as compute capability 9.0 and B200 as 10.0](https://developer.nvidia.com/cuda/gpus). Green Contexts require [CUDA 12.4 or newer](https://docs.nvidia.com/cuda/archive/12.4.1/cuda-driver-api/group__CUDA__GREEN__CONTEXTS.html). A CUDA 12.8+ development image works for either GPU. The CUDA version displayed by `nvidia-smi` describes driver compatibility; check `nvcc --version` for the actual compiler.
+
+Use your home directory; `/workspace` and root access are not required. On a fresh pod:
 
 ```bash
-python3 run_b200_runpod.py --preflight-only
-python3 run_b200_runpod.py
+cd "$HOME"
+git clone https://github.com/shh8228/cuda-green-context-bandwidth-bench.git
+cd cuda-green-context-bandwidth-bench
+nvidia-smi
+nvcc --version
+command -v make g++ python3
+
+# H200: check the environment, then run a shorter initial comparison
+python3 run_h200_runpod.py --preflight-only
+python3 run_h200_runpod.py --modes 1,4 --blocks-per-sm 8 --tma-stages 4 --iterations 10 --trials 3
+
+# Full default sweep, including TMA depths 2, 4, and 8
+python3 run_h200_runpod.py
 ```
 
-The default run uses a 2 GiB input and compares direct L1-bypass loads (mode 1) with TMA (mode 4), with 8 and 32 queued blocks per SM and TMA depths of 2, 4, and 8. It compiles a fresh native `sm_100` executable inside a new results directory, pins the selected GPU by UUID, validates every load mode, then sweeps the supported SM allocations in randomized order. It repeats the full-GPU baseline afterward to reveal drift. Correctness checks also run inside each green context before timing.
+If the repository is already cloned, enter that directory and use the runner from the updated source. For B200, use `python3 run_b200_runpod.py` with the same options. Both entry points detect the selected GPU and choose its build target and toolkit requirement.
+
+If `nvcc` is missing, check whether `/usr/local/cuda/bin/nvcc` exists; if so, add `/usr/local/cuda/bin` to `PATH`. Otherwise, select a CUDA **development** image with the required compiler. A CUDA runtime image or a PyTorch installation alone may lack it. Do not rely on `apt install nvidia-cuda-toolkit` to provide the required version. The runner and text analysis use Python's standard library, so you can run them without `pip`, a virtual environment, or `python3-venv`. `matplotlib` and `numpy` are optional for PNG plots.
+
+The default run uses a 2 GiB input and compares direct L1-bypass loads (mode 1) with TMA (mode 4), with 8 and 32 queued blocks per SM and TMA depths of 2, 4, and 8. It compiles a fresh native executable (`sm_90` on H200, `sm_100` on B200) inside a new results directory, pins the selected GPU by UUID, validates every load mode, then sweeps the supported SM allocations in randomized order. It repeats the full-GPU baseline afterward to reveal drift. Correctness checks also run inside each green context before timing.
 
 For a shorter first run, or for the full validation tools:
 
 ```bash
 # One TMA configuration
-python3 run_b200_runpod.py --modes 4 --blocks-per-sm 8 --tma-stages 4
+python3 run_h200_runpod.py --modes 4 --blocks-per-sm 8 --tma-stages 4
 
 # Additional device instrumentation; requires matching Compute Sanitizer and ncu
-python3 run_b200_runpod.py --sanitize --profile
+python3 run_h200_runpod.py --sanitize --profile
 
 # Select an NVML device index/UUID, buffer size, and a NEW output directory
-python3 run_b200_runpod.py --gpu-id 0 --buffer-mb 4096 --output-dir /workspace/b200-run-1
+python3 run_h200_runpod.py --gpu-id 0 --buffer-mb 4096 --output-dir "$HOME/h200-run-1"
 ```
 
 `--sanitize` runs memcheck, racecheck, and synccheck on the built-in correctness cases before timing. `--profile` separately collects actual DRAM read/write bytes, kernel duration, and DRAM throughput at 8 SMs, the measured 95% point, and the full GPU for each configuration. Profiling requires permission to access performance counters on the Runpod host; `ERR_NVGPUCTRPERM` must be resolved by the host/provider. Profiler event timings are kept separate from ordinary benchmark timings.
 
-Artifacts are saved under `b200_results/<UTC timestamp>/`, or `--output-dir`:
+Artifacts are saved under `h200_results/<UTC timestamp>/` or `b200_results/<UTC timestamp>/`, according to the detected GPU, or `--output-dir`:
 
 - A fresh executable and copies/hashes of its source inputs.
 - `manifest.json` with GPU UUID, driver/toolkit versions, arguments, commands, exit codes, and completion status.
@@ -69,8 +91,8 @@ The benchmark auto-detects the architecture and uses the correct granularity.
 
 ## Prerequisites
 
-- **Compiler**: CUDA ≥ 12.8 for native B200/GB200 (`sm_100`); CUDA ≥ 12.4 for older supported targets. Use a development image with `nvcc`, a host C++ compiler, and `make`.
-- **GPU**: NVIDIA Blackwell GB200 (also works on Hopper, Ampere, etc.)
+- **Compiler**: CUDA ≥ 12.4 for H200 (`sm_90`); CUDA ≥ 12.8 for native B200/GB200 (`sm_100`). Other supported targets require CUDA ≥ 12.4. Use a development image with `nvcc`, a host C++ compiler, and `make`.
+- **GPU**: H200 or B200 for the Runpod runner; the standalone benchmark also supports other Hopper and Ampere GPUs.
 - **Python 3** with `matplotlib` (for plotting; analysis text output works without it)
 
 ## Build
@@ -80,7 +102,7 @@ The benchmark auto-detects the architecture and uses the correct granularity.
 make
 
 # For other architectures:
-make -B CUDA_ARCH=sm_90   # Hopper
+make -B CUDA_ARCH=sm_90   # H200 / Hopper
 make -B CUDA_ARCH=sm_86   # RTX A6000 (use sm_80 for A100)
 ```
 

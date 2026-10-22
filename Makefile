@@ -1,6 +1,5 @@
 # Green Context Bandwidth Saturation Benchmark
-# Targets: NVIDIA Blackwell (GB200), sm_100
-# Container: runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404
+# Targets: H200/Hopper (CUDA_ARCH=sm_90), B200/Blackwell (default sm_100)
 
 NVCC       ?= nvcc
 CUDA_ARCH  ?= sm_100

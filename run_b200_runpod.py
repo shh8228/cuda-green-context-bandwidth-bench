@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build, validate, and measure B200 bandwidth in a Runpod CUDA development pod."""
+"""Build, validate, and measure H200/B200 bandwidth in a Runpod CUDA development pod."""
 import argparse
 import csv
 from datetime import datetime, timezone
@@ -15,6 +15,10 @@ import subprocess
 import sys
 
 ROOT = Path(__file__).resolve().parent
+GPU_TARGETS = {
+    "H200": {"compute_cap": "9.0", "cuda_arch": "sm_90", "minimum_cuda": (12, 4)},
+    "B200": {"compute_cap": "10.0", "cuda_arch": "sm_100", "minimum_cuda": (12, 8)},
+}
 
 
 def integer_list(value):
@@ -44,11 +48,12 @@ def parser():
 def preflight(args):
     for tool in ("nvcc", "nvidia-smi", "make"):
         if not shutil.which(tool):
-            raise RuntimeError(f"{tool} is missing; use a CUDA development image with CUDA 12.8 or newer")
+            raise RuntimeError(f"{tool} is missing; use a CUDA development image with nvcc "
+                               "(H200: CUDA 12.4+, B200: CUDA 12.8+)")
     nvcc = subprocess.check_output(["nvcc", "--version"], text=True)
     version = re.search(r"release (\d+)\.(\d+)", nvcc)
-    if not version or tuple(map(int, version.groups())) < (12, 8):
-        raise RuntimeError("B200 requires an nvcc toolkit of CUDA 12.8 or newer")
+    if not version:
+        raise RuntimeError("Could not determine the CUDA toolkit version from nvcc --version")
     query = subprocess.check_output([
         "nvidia-smi", "-i", args.gpu_id,
         "--query-gpu=index,name,uuid,compute_cap,driver_version,memory.total",
@@ -56,10 +61,20 @@ def preflight(args):
     ], text=True)
     rows = list(csv.reader(query.splitlines(), skipinitialspace=True))
     if len(rows) != 1 or len(rows[0]) != 6:
-        raise RuntimeError("Select exactly one B200 GPU")
-    gpu = dict(zip(("index", "name", "uuid", "compute_cap", "driver_version", "memory_mib"), rows[0]))
-    if "B200" not in gpu["name"].upper() or gpu["compute_cap"] != "10.0":
-        raise RuntimeError(f"Expected a B200 (compute capability 10.0), got {gpu['name']} ({gpu['compute_cap']})")
+        raise RuntimeError("Select exactly one H200, B200, or GB200 GPU")
+    gpu = dict(zip(("index", "name", "uuid", "compute_cap", "driver_version", "memory_mib"),
+                   (field.strip() for field in rows[0])))
+    model = re.search(r"\b(H200|B200|GB200)\b", gpu["name"].upper())
+    if not model:
+        raise RuntimeError(f"Expected an H200, B200, or GB200, got {gpu['name']} ({gpu['compute_cap']})")
+    family = "B200" if model.group(1) == "GB200" else model.group(1)
+    target = GPU_TARGETS[family]
+    if gpu["compute_cap"] != target["compute_cap"]:
+        raise RuntimeError(f"Expected {family} compute capability {target['compute_cap']}, "
+                           f"got {gpu['compute_cap']}")
+    if tuple(map(int, version.groups())) < target["minimum_cuda"]:
+        minimum = ".".join(map(str, target["minimum_cuda"]))
+        raise RuntimeError(f"{family} requires an nvcc toolkit of CUDA {minimum} or newer")
     tools = {}
     for requested, tool in ((args.sanitize, "compute-sanitizer"), (args.profile, "ncu")):
         if requested:
@@ -67,7 +82,7 @@ def preflight(args):
                 raise RuntimeError(f"{tool} is required for the requested validation; install matching CUDA toolkit tools")
             tools[tool] = {"path": shutil.which(tool), "version": subprocess.check_output(
                 [tool, "--version"], text=True, stderr=subprocess.STDOUT)}
-    return {"gpu": gpu, "cuda_arch": "sm_100", "nvcc_version": nvcc,
+    return {"gpu": gpu, "gpu_family": family, "cuda_arch": target["cuda_arch"], "nvcc_version": nvcc,
             "nvcc_path": shutil.which("nvcc"), "validation_tools": tools}
 
 
@@ -136,7 +151,7 @@ def main(argv=None):
         print(json.dumps(meta, indent=2))
         return 0
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
-    out = (args.output_dir or ROOT / "b200_results" / timestamp).resolve()
+    out = (args.output_dir or ROOT / f"{meta['gpu_family'].lower()}_results" / timestamp).resolve()
     out.mkdir(parents=True, exist_ok=False)
     manifest = out / "manifest.json"
     meta.update({"started_utc": timestamp, "complete": False, "runs": [],
@@ -169,11 +184,11 @@ def main(argv=None):
         source.mkdir()
         meta["source_sha256"] = {}
         for name in ("green_ctx_bw_bench.cu", "bench_options.h", "Makefile",
-                     "run_b200_runpod.py", "plot_results.py"):
+                     "run_b200_runpod.py", "run_h200_runpod.py", "plot_results.py"):
             shutil.copy2(ROOT / name, source / name)
             meta["source_sha256"][name] = hashlib.sha256((source / name).read_bytes()).hexdigest()
         binary = out / "green_ctx_bw_bench"
-        run(["make", "-B", "all", "CUDA_ARCH=sm_100", f"NVCC={meta['nvcc_path']}", f"TARGET={binary}"],
+        run(["make", "-B", "all", f"CUDA_ARCH={meta['cuda_arch']}", f"NVCC={meta['nvcc_path']}", f"TARGET={binary}"],
             "build", working_dir=source)
         probe_file = run([binary, "--external-probe", "0"], "residency")
         meta["residency_probe"] = json.loads(probe_file.read_text())
@@ -221,9 +236,13 @@ def main(argv=None):
     return 0
 
 
-if __name__ == "__main__":
+def cli():
     try:
-        sys.exit(main())
+        return main()
     except (RuntimeError, OSError, subprocess.SubprocessError) as error:
         print(f"Error: {error}", file=sys.stderr)
-        sys.exit(1)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(cli())

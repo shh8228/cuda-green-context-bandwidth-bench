@@ -111,6 +111,105 @@ does not identify a hardware request-queue limit. Neither result predicts Tensor
 Core performance: a real WGMMA/TCGEN05 consumer has different operand layouts,
 synchronization, accumulator storage, and useful computation.
 
+### B200 Tensor Core consumer (mode 6)
+
+Mode 6 adds an actual `tcgen05.mma.cta_group::1.kind::tf32` consumer. It requires
+**CUDA 12.8+ and `sm_100a`**, including when `sm_100` already built successfully.
+H200 is not supported for this mode. Existing modes retain their original targets.
+
+Each TMA transfer streams a packed **A[128×32] TF32 tile (16 KiB)**. A small
+**B[32×N]** matrix is initialized in shared memory once per CTA. Four K=8 MMAs
+consume each A tile; outputs accumulate in TMEM across that CTA's input tiles,
+then every output is read from TMEM and written to global memory once. No extra
+MMA repetitions are added to inflate arithmetic work.
+
+| `--tc-n` | FLOPs per A tile | FLOPs per streamed input byte | Shared B per CTA |
+|---|---:|---:|---:|
+| 8 (default) | 65,536 | 4 | 1 KiB |
+| 16 | 131,072 | 8 | 2 KiB |
+| 32 | 262,144 | 16 | 4 KiB |
+
+Three runtime branches of the **same compiled kernel** are selectable with
+`--tc-consumer mma|sum|copy`. For a fixed N and stage count they reserve the same
+registers, shared buffers, 32 TMEM columns (16 KiB), and global output footprint.
+`sum` consumes all A elements through SIMT shared loads; `copy` waits for all
+transfers without reading their payload. Both controls retain the TMEM allocation
+and B setup. Their completion barrier uses a software arrival instead of MMA's
+async commit, and their epilogue writes repeated sums/completion counts instead
+of reading TMEM. These are matched-resource controls, not instruction-identical
+workloads. They should be compared with mode-6 MMA, not silently substituted for
+the older mode-4 controls.
+
+**Run from the updated checkout on B200:**
+
+```bash
+# Build and check all modes; includes 27 TC shape/stage/consumer combinations.
+make test-gpu CUDA_ARCH=sm_100a
+
+# Small first check inside an 8-SM green context (default N=8, MMA).
+./green_ctx_bw_bench --sm-count 8 --blocks-per-sm 24 --tma-stages 2 \
+  --require-dram 2048 20 0 0 7 6
+
+# Matched three-way SM sweep, lightest arithmetic first.
+python3 run_b200_runpod.py --modes 6 --tc-n 8 --tc-consumers mma,sum,copy \
+  --blocks-per-sm 24 --tma-stages 2,4 --iterations 20 --trials 7 \
+  --output-dir b200_tc_n8
+
+# Arithmetic-intensity sensitivity: 4, 8, 16 FLOPs/input byte.
+python3 run_b200_runpod.py --modes 6 --tc-n 8,16,32 --tc-consumers mma,sum,copy \
+  --blocks-per-sm 24 --tma-stages 2,4 --iterations 20 --trials 7 \
+  --output-dir b200_tc_intensity
+```
+
+The runner selects `sm_100a` automatically when mode 6 is requested. Files include
+the shape and consumer, e.g. `mode6_blocks24_stages2_n8_mma.csv`. The manifest
+preserves the source, build target and arguments; CSV records also identify N,
+consumer and `mma_flops_per_input_byte` (zero for the non-MMA controls; this
+does not count SIMT sums). Use a new output directory for each run.
+
+Before relying on results, run the device validation under a matching Compute
+Sanitizer (these tools do not use Nsight Compute performance counters):
+
+```bash
+for tool in memcheck racecheck synccheck; do
+  compute-sanitizer --tool "$tool" --error-exitcode 1 \
+    ./green_ctx_bw_bench --validate-only --tc-n 8 --tma-stages 2 1 1 0 0 1 6 || break
+done
+# Or add --sanitize to the runner to check every requested configuration.
+```
+
+Validation compares **every MMA output** with an independent CPU matrix reference
+on varied exactly representable inputs, including partial tiles, idle CTAs and
+multiple barrier phase wraps. For sum/copy it additionally checks the selected
+branch outside timing. Copy completion counts alone do not verify payload data.
+
+The bandwidth numerator is only streamed A bytes. B initialization, TMEM
+allocation, synchronization, computation and output stores are included in time;
+their bytes are not added to that numerator. TF32 inputs are preformatted in the
+TCGEN05 no-swizzle K-major layout (logical row `r`, reduction index `k` maps to
+`(k/4)*512 + r*4 + k%4`), so there is no timed packing pass. Timing input values
+have their low 13 mantissa bits zeroed for valid TF32 operands, consistently for
+all three consumers. These format/data changes also limit direct comparison with
+old mode-4 measurements.
+
+Start with N=8, but **low FLOPs/byte does not prove an HBM bottleneck**. Small MMA
+shapes, synchronization and the compute capacity of the allocated SMs can still
+limit throughput. Compare absolute bandwidth at each SM allocation as N grows,
+and compare the matched copy curve too. Increasing N also changes B shared size
+and the output footprint; use each N's matched controls and resource logs to
+interpret a drop. Use one common full-GPU reference when comparing saturation
+thresholds, and repeat runs in reversed consumer order to assess drift (for
+example `--tc-consumers copy,sum,mma`).
+
+This is a consumer-path microbenchmark, **not a complete decode GEMM or serving
+workload**: B is reused across tiles and accumulated output traffic is amortized.
+It neither reproduces model/KV layouts and quantization nor concurrent prefill.
+The implementation can be compiled and its host paths tested without a GPU;
+correctness and performance of TCGEN05 require validation on the actual B200.
+
+Implementation references: NVIDIA's [TCGEN05 PTX specification](https://docs.nvidia.com/cuda/parallel-thread-execution/#tensorcore-5th-generation-instructions)
+and [CUTLASS TF32 shared/shared instruction wrappers](https://github.com/NVIDIA/cutlass/blob/main/include/cute/arch/mma_sm100_umma.hpp).
+
 ## Motivation
 
 When spatially partitioning a GPU with CUDA Green Contexts (e.g., for disaggregated serving, MPS-like workload isolation, or co-located inference), a key question is: **how many SMs are actually needed to saturate memory bandwidth?** If a memory-bound kernel saturates DRAM bandwidth with only a fraction of available SMs, the remaining SMs can be allocated to compute-bound work without degrading memory throughput.
@@ -177,7 +276,7 @@ bash run_bench.sh 512 20 0 0
 | `gpu_id` | 0 | CUDA device index. |
 | `sm_step` | 0 (auto) | SM count step size. 0 = use the supported alignment (2 on Ampere, 8 on Hopper/B200). |
 | `trials` | 5 | Number of independent trials; reports median. |
-| `load_mode` | 0 | 0 = default `__ldg`, 1 = L1-bypass (`ld.global.cg`), 2 = `cp.async` staging, 3 = cooperative-groups async staging, 4 = TMA (`cp.async.bulk.tensor`, SM90+ only), 5 = decode-like KV-cache sweep. |
+| `load_mode` | 0 | 0 = default `__ldg`, 1 = L1-bypass (`ld.global.cg`), 2 = `cp.async` staging, 3 = cooperative-groups async staging, 4 = TMA (`cp.async.bulk.tensor`, SM90+ only), 5 = decode-like KV-cache sweep, 6 = TCGEN05 TF32 (B200, `sm_100a`). |
 
 ### Load Modes
 

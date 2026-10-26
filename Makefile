@@ -19,7 +19,7 @@ all: $(TARGET)
 # Flags/architectures may change without a source timestamp change.
 FORCE:
 
-$(TARGET): $(SRC) bench_options.h Makefile FORCE
+$(TARGET): $(SRC) bench_options.h tma_tensor_core.cuh Makefile FORCE
 	$(NVCC) $(NVCC_FLAGS) $< -o $@ $(LDFLAGS)
 
 # Default run: 512MB buffer, 20 iterations, GPU 0, auto SM step
@@ -38,7 +38,7 @@ test: $(TARGET)
 	BENCHMARK_BINARY=$(abspath $(TARGET)) python3 -m unittest discover -s tests -v
 
 test-gpu: $(TARGET)
-	RUN_CUDA_TESTS=1 BENCHMARK_BINARY=$(abspath $(TARGET)) python3 -m unittest discover -s tests -v
+	RUN_CUDA_TESTS=1 RUN_TCGEN05_TESTS=$(if $(filter sm_100a,$(CUDA_ARCH)),1,0) BENCHMARK_BINARY=$(abspath $(TARGET)) python3 -m unittest discover -s tests -v
 
 clean:
 	rm -f $(TARGET) results.csv *.png

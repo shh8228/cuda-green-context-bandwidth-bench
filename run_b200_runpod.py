@@ -38,6 +38,8 @@ def parser():
     p.add_argument("--blocks-per-sm", type=integer_list, default=(8, 32))
     p.add_argument("--tma-stages", type=integer_list, default=(2, 4, 8))
     p.add_argument("--tma-copy-only", action="store_true", help="TMA transfer/wait control without the SIMT consumer")
+    p.add_argument("--tc-n", type=integer_list, default=(8,), help="mode 6 N values: 8,16,32 (4,8,16 FLOPs/input byte)")
+    p.add_argument("--tc-consumers", default="mma", help="mode 6 consumers, comma-separated: mma,sum,copy")
     p.add_argument("--seed", type=int, default=8228)
     p.add_argument("--sanitize", action="store_true", help="also run memcheck, racecheck, and synccheck")
     p.add_argument("--profile", action="store_true", help="collect Nsight DRAM counters at 8 SMs, threshold, and full GPU")
@@ -70,6 +72,8 @@ def preflight(args):
         raise RuntimeError(f"Expected an H200, B200, or GB200, got {gpu['name']} ({gpu['compute_cap']})")
     family = "B200" if model.group(1) == "GB200" else model.group(1)
     target = GPU_TARGETS[family]
+    if 6 in args.modes and family != "B200":
+        raise RuntimeError("mode 6 requires B200/GB200 and a sm_100a build")
     if gpu["compute_cap"] != target["compute_cap"]:
         raise RuntimeError(f"Expected {family} compute capability {target['compute_cap']}, "
                            f"got {gpu['compute_cap']}")
@@ -83,15 +87,24 @@ def preflight(args):
                 raise RuntimeError(f"{tool} is required for the requested validation; install matching CUDA toolkit tools")
             tools[tool] = {"path": shutil.which(tool), "version": subprocess.check_output(
                 [tool, "--version"], text=True, stderr=subprocess.STDOUT)}
-    return {"gpu": gpu, "gpu_family": family, "cuda_arch": target["cuda_arch"], "nvcc_version": nvcc,
+    return {"gpu": gpu, "gpu_family": family,
+            "cuda_arch": "sm_100a" if 6 in args.modes else target["cuda_arch"], "nvcc_version": nvcc,
             "nvcc_path": shutil.which("nvcc"), "validation_tools": tools}
 
 
 def configurations(args):
     for mode in args.modes:
         for blocks in args.blocks_per_sm:
-            for stages in (args.tma_stages if mode == 4 else (2,)):
-                yield mode, blocks, stages
+            for stages in (args.tma_stages if mode in (4, 6) else (2,)):
+                for n in (args.tc_n if mode == 6 else (0,)):
+                    for consumer in (args.tc_consumers if mode == 6 else ("none",)):
+                        yield mode, blocks, stages, n, consumer
+
+
+def consumer_options(args, mode, n, consumer):
+    if mode == 6:
+        return ["--tc-n", n, "--tc-consumer", consumer]
+    return ["--tma-copy-only"] if mode == 4 and args.tma_copy_only else []
 
 
 def parse_ncu_report(path, input_bytes):
@@ -141,12 +154,17 @@ def main(argv=None):
     args = p.parse_args(argv)
     if min(args.buffer_mb, args.iterations, args.trials) <= 0 or not 0 <= args.seed <= 2147483647:
         p.error("buffer size, iterations, and trials must be positive; seed must be in 0..2147483647")
-    if any(m not in range(6) for m in args.modes):
-        p.error("--modes must contain values from 0 through 5")
+    if any(m not in range(7) for m in args.modes):
+        p.error("--modes must contain values from 0 through 6")
     if any(not 1 <= b <= 256 for b in args.blocks_per_sm):
         p.error("--blocks-per-sm must contain values in 1..256")
     if any(s not in (2, 4, 8) for s in args.tma_stages):
         p.error("--tma-stages must contain only 2, 4, or 8")
+    if any(n not in (8, 16, 32) for n in args.tc_n):
+        p.error("--tc-n must contain only 8, 16, or 32")
+    args.tc_consumers = tuple(dict.fromkeys(args.tc_consumers.split(",")))
+    if any(c not in ("mma", "sum", "copy") for c in args.tc_consumers):
+        p.error("--tc-consumers must contain only mma, sum, or copy")
     meta = preflight(args)
     if args.preflight_only:
         print(json.dumps(meta, indent=2))
@@ -184,7 +202,7 @@ def main(argv=None):
         source = out / "source"
         source.mkdir()
         meta["source_sha256"] = {}
-        for name in ("green_ctx_bw_bench.cu", "bench_options.h", "Makefile",
+        for name in ("green_ctx_bw_bench.cu", "bench_options.h", "tma_tensor_core.cuh", "Makefile",
                      "run_b200_runpod.py", "run_h200_runpod.py", "plot_results.py"):
             shutil.copy2(ROOT / name, source / name)
             meta["source_sha256"][name] = hashlib.sha256((source / name).read_bytes()).hexdigest()
@@ -194,21 +212,24 @@ def main(argv=None):
         probe_file = run([binary, "--external-probe", "0"], "residency")
         meta["residency_probe"] = json.loads(probe_file.read_text())
         total_sms = meta["residency_probe"]["total_sm_count"]
-        for mode in range(6):
-            for stages in (args.tma_stages if mode == 4 else (2,)):
-                consumer = ["--tma-copy-only"] if args.tma_copy_only and mode == 4 else []
-                command = [binary, "--validate-only", *consumer, "--tma-stages", stages, "1", "1", "0", "0", "1", mode]
-                name = f"validate_mode{mode}_stages{stages}"
-                run(command, name, timeout=180)
-                if args.sanitize:
-                    for tool in ("memcheck", "racecheck", "synccheck"):
-                        run(["compute-sanitizer", "--tool", tool, "--error-exitcode", "1", *command],
-                            f"{name}_{tool}", timeout=600)
-        for mode, blocks, stages in configurations(args):
-            name = f"mode{mode}_blocks{blocks}_stages{stages}"
+        validation_args = argparse.Namespace(**vars(args))
+        validation_args.modes = tuple(range(7 if 6 in args.modes else 6))
+        validation_args.blocks_per_sm = (1,)
+        for mode, _, stages, n, consumer in configurations(validation_args):
+            extra = consumer_options(args, mode, n, consumer)
+            suffix = f"_n{n}_{consumer}" if mode == 6 else ""
+            command = [binary, "--validate-only", *extra, "--tma-stages", stages, "1", "1", "0", "0", "1", mode]
+            name = f"validate_mode{mode}_stages{stages}{suffix}"
+            run(command, name, timeout=180)
+            if args.sanitize:
+                for tool in ("memcheck", "racecheck", "synccheck"):
+                    run(["compute-sanitizer", "--tool", tool, "--error-exitcode", "1", *command],
+                        f"{name}_{tool}", timeout=600)
+        for mode, blocks, stages, n, consumer in configurations(args):
+            suffix = f"_n{n}_{consumer}" if mode == 6 else ""
+            name = f"mode{mode}_blocks{blocks}_stages{stages}{suffix}"
             tuning = ["--blocks-per-sm", blocks, "--tma-stages", stages, "--seed", args.seed]
-            if args.tma_copy_only and mode == 4:
-                tuning.append("--tma-copy-only")
+            tuning += consumer_options(args, mode, n, consumer)
             run([binary, "--require-dram", *tuning, args.buffer_mb, args.iterations,
                  "0", "0", args.trials, mode], name, stdout_path=out / f"{name}.csv")
             run([sys.executable, source / "plot_results.py", out / f"{name}.csv", out / f"{name}.png"], f"{name}_plot")

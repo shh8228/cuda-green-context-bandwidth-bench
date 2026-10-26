@@ -15,6 +15,8 @@ struct BenchOptions {
     bool help = false, external_single = false, external_probe = false;
     bool validate_only = false, skip_validation = false, require_dram = false;
     bool tma_copy_only = false;
+    int tc_n = 8;
+    std::string tc_consumer = "mma";
 };
 
 inline unsigned long long parse_integer(const char *value, const char *name,
@@ -33,6 +35,7 @@ inline unsigned long long parse_integer(const char *value, const char *name,
 inline BenchOptions parse_options(int argc, char **argv)
 {
     BenchOptions o;
+    bool tc_option = false;
     std::vector<const char *> positional;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -43,19 +46,29 @@ inline BenchOptions parse_options(int argc, char **argv)
         else if (arg == "--skip-validation") o.skip_validation = true;
         else if (arg == "--require-dram") o.require_dram = true;
         else if (arg == "--tma-copy-only") o.tma_copy_only = true;
+        else if (arg == "--tc-consumer") {
+            if (++i == argc) throw std::invalid_argument(arg + " requires a value");
+            o.tc_consumer = argv[i];
+            tc_option = true;
+        }
         else if (arg == "--blocks-per-sm" || arg == "--tma-stages" ||
-                 arg == "--sm-count" || arg == "--seed") {
+                 arg == "--sm-count" || arg == "--seed" || arg == "--tc-n") {
             if (++i == argc) throw std::invalid_argument(arg + " requires a value");
             int n = static_cast<int>(parse_integer(argv[i], arg.c_str(), arg == "--seed" ? 0 : 1));
             if (arg == "--blocks-per-sm") o.blocks_per_sm = n;
             else if (arg == "--tma-stages") o.tma_stages = n;
             else if (arg == "--sm-count") o.sm_count = n;
+            else if (arg == "--tc-n") { o.tc_n = n; tc_option = true; }
             else o.seed = n;
         } else if (arg.rfind("--", 0) == 0)
             throw std::invalid_argument("Unknown option: " + arg);
         else positional.push_back(argv[i]);
     }
     if (o.help) return o;
+    if (o.tc_n != 8 && o.tc_n != 16 && o.tc_n != 32)
+        throw std::invalid_argument("--tc-n must be 8, 16, or 32");
+    if (o.tc_consumer != "mma" && o.tc_consumer != "sum" && o.tc_consumer != "copy")
+        throw std::invalid_argument("--tc-consumer must be mma, sum, or copy");
     if (o.tma_stages != 2 && o.tma_stages != 4 && o.tma_stages != 8)
         throw std::invalid_argument("--tma-stages must be 2, 4, or 8");
     if (o.blocks_per_sm > 256)
@@ -64,6 +77,7 @@ inline BenchOptions parse_options(int argc, char **argv)
         (o.sm_count && (o.external_single || o.external_probe || o.validate_only)))
         throw std::invalid_argument("Select only one execution mode");
     if (o.external_probe) {
+        if (tc_option) throw std::invalid_argument("--tc-n/--tc-consumer requires load_mode 6");
         if (positional.size() > 1) throw std::invalid_argument("--external-probe accepts only gpu_id");
         if (!positional.empty()) o.gpu_id = parse_integer(positional[0], "gpu_id", 0);
         return o;
@@ -87,7 +101,9 @@ inline BenchOptions parse_options(int argc, char **argv)
         case 5: o.load_mode = n; break;
         }
     }
-    if (o.load_mode > 5) throw std::invalid_argument("load_mode must be between 0 and 5");
+    if (o.load_mode > 6) throw std::invalid_argument("load_mode must be between 0 and 6");
+    if (tc_option && o.load_mode != 6)
+        throw std::invalid_argument("--tc-n/--tc-consumer requires load_mode 6");
     if (o.tma_copy_only && o.load_mode != 4)
         throw std::invalid_argument("--tma-copy-only requires load_mode 4");
     return o;

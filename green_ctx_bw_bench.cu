@@ -49,6 +49,7 @@ enum class LoadMode {
     PipelineAsync = 3,
     Tma = 4,
     DecodeLike = 5,
+    TensorCore = 6,
 };
 
 static constexpr size_t kTmaTileBytes = 16384;
@@ -61,6 +62,8 @@ static constexpr size_t kDecodeKvFloat4s = kDecodeTileFloat4s / 2;
 
 static LoadMode g_load_mode = LoadMode::Default;
 static BenchOptions g_options;
+
+#include "tma_tensor_core.cuh"
 
 // ---------------------------------------------------------------------------
 // Error checking macros
@@ -372,6 +375,7 @@ static const char *load_mode_name(LoadMode mode)
     case LoadMode::PipelineAsync: return "pipeline async staging";
     case LoadMode::Tma: return "TMA (cp.async.bulk.tensor)";
     case LoadMode::DecodeLike: return "Decode-like KV-cache sweep";
+    case LoadMode::TensorCore: return "TMA with TCGEN05 TF32 consumer / matched controls";
     }
     return "Unknown";
 }
@@ -383,7 +387,40 @@ static bool uses_shared_staging(LoadMode mode)
 
 static bool uses_tma(LoadMode mode)
 {
-    return mode == LoadMode::Tma;
+    return mode == LoadMode::Tma || mode == LoadMode::TensorCore;
+}
+
+static TcConsumer tc_consumer()
+{
+    return g_options.tc_consumer == "mma" ? TcConsumer::Mma :
+           (g_options.tc_consumer == "sum" ? TcConsumer::Sum : TcConsumer::Copy);
+}
+
+static size_t sink_values_per_block()
+{
+    return g_load_mode == LoadMode::TensorCore ? 128 * g_options.tc_n : 256;
+}
+
+static size_t dynamic_shared_bytes()
+{
+    if (g_load_mode == LoadMode::TensorCore)
+        return g_options.tma_stages * kTmaTileBytes + 32 * g_options.tc_n * sizeof(float);
+    if (uses_tma(g_load_mode)) return g_options.tma_stages * kTmaTileBytes;
+    return uses_shared_staging(g_load_mode) ? 256 * sizeof(float4) : 0;
+}
+
+template<int Stages> static const void *tc_shape_kernel()
+{
+    if (g_options.tc_n == 16) return reinterpret_cast<const void *>(read_bandwidth_kernel_tc<Stages, 16>);
+    if (g_options.tc_n == 32) return reinterpret_cast<const void *>(read_bandwidth_kernel_tc<Stages, 32>);
+    return reinterpret_cast<const void *>(read_bandwidth_kernel_tc<Stages, 8>);
+}
+
+static const void *selected_tc_kernel()
+{
+    if (g_options.tma_stages == 4) return tc_shape_kernel<4>();
+    if (g_options.tma_stages == 8) return tc_shape_kernel<8>();
+    return tc_shape_kernel<2>();
 }
 
 static bool build_tma_context(CUdevice cuDev, const float4 *d_src, size_t buf_bytes,
@@ -462,6 +499,14 @@ static void launch_selected_kernel(const float4 *d_src, float *d_sink,
     case LoadMode::DecodeLike:
         read_bandwidth_kernel_decode_like<<<blocks, threads, 0, stream>>>(d_src, d_sink, n_float4);
         break;
+    case LoadMode::TensorCore: {
+        TcConsumer consumer = check_tma_payload ? TcConsumer::Mma : tc_consumer();
+        const CUtensorMap *map = tma_ctx.d_tensor_map;
+        void *args[] = {&d_sink, &n_float4, &map, &consumer};
+        CUDA_RT_CHECK(cudaLaunchKernel(selected_tc_kernel(), dim3(blocks), dim3(threads),
+                                      args, dynamic_shared_bytes(), stream));
+        break;
+    }
     }
     CUDA_RT_CHECK(cudaGetLastError());
 }
@@ -474,6 +519,7 @@ static const void *selected_kernel()
     case LoadMode::CpAsync: return reinterpret_cast<const void *>(read_bandwidth_kernel_cp_async);
     case LoadMode::PipelineAsync: return reinterpret_cast<const void *>(read_bandwidth_kernel_pipeline);
     case LoadMode::DecodeLike: return reinterpret_cast<const void *>(read_bandwidth_kernel_decode_like);
+    case LoadMode::TensorCore: return selected_tc_kernel();
     case LoadMode::Tma:
         if (g_options.tma_stages == 4) return reinterpret_cast<const void *>(read_bandwidth_kernel_tma<4>);
         if (g_options.tma_stages == 8) return reinterpret_cast<const void *>(read_bandwidth_kernel_tma<8>);
@@ -484,6 +530,15 @@ static const void *selected_kernel()
 
 static void configure_selected_kernel(int cc_major, int dev_id)
 {
+    if (g_load_mode == LoadMode::TensorCore) {
+        int supported = 0;
+        CUDA_RT_CHECK(cudaMemcpyFromSymbol(&supported, tcgen05_image_supported, sizeof(supported)));
+        if (cc_major != 10 || !supported) {
+            fprintf(stderr, "Mode 6 requires B200/GB200 and a CUDA >= 12.8 sm_100a build. "
+                    "Rebuild with make CUDA_ARCH=sm_100a.\n");
+            exit(EXIT_FAILURE);
+        }
+    }
     cudaFuncAttributes attr{};
     CUDA_RT_CHECK(cudaFuncGetAttributes(&attr, selected_kernel()));
     const int minimum = uses_tma(g_load_mode) ? 90 :
@@ -494,9 +549,7 @@ static void configure_selected_kernel(int cc_major, int dev_id)
                 minimum, cc_major, attr.ptxVersion);
         exit(EXIT_FAILURE);
     }
-    size_t dynamic_bytes = uses_tma(g_load_mode)
-        ? g_options.tma_stages * kTmaTileBytes :
-          (uses_shared_staging(g_load_mode) ? 256 * sizeof(float4) : 0);
+    size_t dynamic_bytes = dynamic_shared_bytes();
     if (uses_tma(g_load_mode)) {
         int maximum = 0;
         CUDA_RT_CHECK(cudaDeviceGetAttribute(&maximum, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev_id));
@@ -516,6 +569,13 @@ static void configure_selected_kernel(int cc_major, int dev_id)
             static_cast<int>(g_load_mode), attr.ptxVersion, attr.numRegs,
             dynamic_bytes + attr.sharedSizeBytes, resident_blocks,
             g_options.blocks_per_sm, g_options.tma_stages, g_options.tma_copy_only);
+    if (g_load_mode == LoadMode::TensorCore)
+        fprintf(stderr, "TCGEN05: consumer=%s A=128x32 B=32x%d TF32; mma_flops_per_input_byte=%g; "
+                "tmem_columns_per_cta=32 sink_bytes_per_cta=%zu. "
+                "Bandwidth counts streaming A only; B setup and output are timed.\n",
+                g_options.tc_consumer.c_str(), g_options.tc_n,
+                tc_consumer() == TcConsumer::Mma ? g_options.tc_n / 2.0 : 0.0,
+                sink_values_per_block() * sizeof(float));
 }
 
 static int grid_blocks(size_t n_float4, int sms)
@@ -537,8 +597,88 @@ static float validation_value(size_t index, unsigned lane)
 
 struct ValidationStats { size_t cases = 0, checked_float4s = 0, completion_cases = 0; };
 
+static ValidationStats validate_tc_kernel(CUdevice device, cudaStream_t stream)
+{
+    ValidationStats stats;
+    const size_t sizes[] = {256, 16128, 16384, 16640, 65792, 1048832};
+    const int grids[] = {1, 3, 17};
+    const size_t output_stride = sink_values_per_block();
+    for (size_t bytes : sizes) {
+        const size_t count = bytes / sizeof(float4);
+        std::vector<float> input(bytes / sizeof(float));
+        for (size_t p = 0; p < input.size(); ++p) input[p] = validation_value(p / 4, p % 4);
+        float4 *src = nullptr;
+        float *sink = nullptr;
+        CUDA_RT_CHECK(cudaMalloc(&src, bytes));
+        CUDA_RT_CHECK(cudaMalloc(&sink, 17 * output_stride * sizeof(float)));
+        CUDA_RT_CHECK(cudaMemcpy(src, input.data(), bytes, cudaMemcpyHostToDevice));
+        TmaContext tma{};
+        build_tma_context(device, src, bytes, &tma);
+        for (int blocks : grids) {
+            std::vector<double> expected(blocks * output_stride, 0.0);
+            std::vector<double> sums(blocks * 256, 0.0);
+            // CPU ownership from global physical offsets, not the GPU loop.
+            // Packed A offset = k_outer*512 + row*4 + k_inner.
+            for (size_t p = 0; p < input.size(); ++p) {
+                size_t tile = p / 4096, offset = p % 4096;
+                size_t block = tile % blocks;
+                int row = (offset % 512) / 4;
+                int k = (offset / 512) * 4 + offset % 4;
+                for (int n = 0; n < g_options.tc_n; ++n) {
+                    // Independent expression for deterministic B coefficients.
+                    double weight = ((17 * k + 13 * n + 3 * k * n) % 127 - 63) / 64.0;
+                    expected[block * output_stride + row * g_options.tc_n + n] += input[p] * weight;
+                }
+                sums[block * 256 + (offset / 4) % 256] += input[p];
+            }
+            auto check = [&](bool payload, const std::vector<double> &reference) {
+                CUDA_RT_CHECK(cudaMemsetAsync(sink, 0xff, reference.size() * sizeof(float), stream));
+                launch_selected_kernel(src, sink, count, blocks, 256, stream, tma, payload);
+                CUDA_RT_CHECK(cudaStreamSynchronize(stream));
+                std::vector<float> actual(reference.size());
+                CUDA_RT_CHECK(cudaMemcpy(actual.data(), sink, actual.size() * sizeof(float), cudaMemcpyDeviceToHost));
+                for (size_t j = 0; j < actual.size(); ++j) {
+                    // Integer inputs and B in multiples of 1/64 keep this workload
+                    // exactly representable even across repeated MMA tiles.
+                    if (actual[j] != reference[j]) {
+                        fprintf(stderr, "TC validation FAILED consumer=%s N=%d stages=%d "
+                                "bytes=%zu blocks=%d output=%zu expected=%.9g actual=%.9g\n",
+                                payload ? "mma" : g_options.tc_consumer.c_str(),
+                                g_options.tc_n, g_options.tma_stages, bytes, blocks,
+                                j, reference[j], actual[j]);
+                        exit(EXIT_FAILURE);
+                    }
+                }
+            };
+            // Verify every MMA output, even for copy/sum timing selections.
+            check(true, expected);
+            ++stats.cases;
+            stats.checked_float4s += count;
+            if (tc_consumer() != TcConsumer::Mma) {
+                const size_t tiles = (count + kTmaTileFloat4s - 1) / kTmaTileFloat4s;
+                for (size_t j = 0; j < expected.size(); ++j) {
+                    size_t block = j / output_stride;
+                    expected[j] = tc_consumer() == TcConsumer::Sum
+                        ? sums[block * 256 + (j % output_stride) % 256]
+                        : double(tiles / blocks + (block < tiles % blocks));
+                }
+                check(false, expected);
+                if (tc_consumer() == TcConsumer::Copy) ++stats.completion_cases;
+            }
+        }
+        CUDA_RT_CHECK(cudaFree(tma.d_tensor_map));
+        CUDA_RT_CHECK(cudaFree(sink));
+        CUDA_RT_CHECK(cudaFree(src));
+    }
+    fprintf(stderr, "TC validation PASSED: %zu matrix cases, %zu float4 inputs; "
+            "consumer=%s checked outside timing\n", stats.cases, stats.checked_float4s,
+            g_options.tc_consumer.c_str());
+    return stats;
+}
+
 static ValidationStats validate_selected_kernel(CUdevice device, cudaStream_t stream)
 {
+    if (g_load_mode == LoadMode::TensorCore) return validate_tc_kernel(device, stream);
     ValidationStats stats;
     const size_t sizes[] = {256, 16128, 16384, 16640, 65792, 1048832};
     const int grids[] = {1, 3, 17};
@@ -624,17 +764,19 @@ static ValidationStats validate_selected_kernel(CUdevice device, cudaStream_t st
     return stats;
 }
 
-__global__ void initialize_benchmark_input(float4 *src, size_t n)
+__global__ void initialize_benchmark_input(float4 *src, size_t n, bool tf32)
 {
     for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
          i < n; i += (size_t)blockDim.x * gridDim.x) {
         uint32_t x = static_cast<uint32_t>(i) * 747796405U + 2891336453U;
         x ^= x >> 16;
         // Normal finite floats with varied mantissas, avoiding uniform data.
-        src[i] = make_float4(__uint_as_float(0x3f000000U | (x & 0x007fffffU)),
-                            __uint_as_float(0x3f800000U | ((x * 1664525U) & 0x007fffffU)),
-                            __uint_as_float(0xbf000000U | ((x * 1013904223U) & 0x007fffffU)),
-                            __uint_as_float(0xbf800000U | ((x * 22695477U) & 0x007fffffU)));
+        // TCGEN05 TF32 shared operands must already have TF32 precision.
+        const uint32_t mask = tf32 ? 0x007fe000U : 0x007fffffU;
+        src[i] = make_float4(__uint_as_float(0x3f000000U | (x & mask)),
+                            __uint_as_float(0x3f800000U | ((x * 1664525U) & mask)),
+                            __uint_as_float(0xbf000000U | ((x * 1013904223U) & mask)),
+                            __uint_as_float(0xbf800000U | ((x * 22695477U) & mask)));
     }
 }
 
@@ -831,20 +973,44 @@ static void print_usage(const char *program)
     printf("  --blocks-per-sm N   Queued CTAs per allocated SM, 1..256 (default 32)\n");
     printf("  --tma-stages N      TMA pipeline stages: 2, 4, or 8 (default 2)\n");
     printf("  --tma-copy-only     TMA transfer/wait control without tile reads or FP32 sums (mode 4)\n");
+    printf("  --tc-consumer X     Mode 6: mma (default), sum, or copy; matched kernel/resources\n");
+    printf("  --tc-n N            Mode 6: 8/16/32 columns; MMA intensity 4/8/16 FLOPs/input byte\n");
     printf("  --sm-count N        Measure one partition, emitting a single JSON record\n");
     printf("  --require-dram      Require input >= 4 times the GPU's L2 capacity\n");
     printf("  --seed N            Randomized sweep order (default 8228)\n");
-    printf("Modes: 0=__ldg, 1=ld.global.cg, 2=cp.async, 3=cooperative copy, 4=TMA, 5=decode-like\n");
+    printf("Modes: 0=__ldg, 1=ld.global.cg, 2=cp.async, 3=cooperative copy, 4=TMA, 5=decode-like, 6=TCGEN05\n");
     printf("Correctness checks run before timing unless --skip-validation is supplied.\n");
     printf("--external-single emits one external_single JSON record with bandwidth_GBps,\n");
     printf("observed_sm_count and observed_sm_ids; --external-probe emits external_probe JSON\n");
     printf("with residency only. These modes support external nvtaskset placement.\n");
     printf("B200 native builds require CUDA >= 12.8 and CUDA_ARCH=sm_100.\n");
+    printf("Mode 6 requires B200/GB200, CUDA >= 12.8 and CUDA_ARCH=sm_100a.\n");
 }
 
 static void print_sm_ids(const std::vector<unsigned int> &ids)
 {
     for (size_t i = 0; i < ids.size(); ++i) printf("%s%u", i ? "," : "", ids[i]);
+}
+
+static double mma_flops_per_input_byte()
+{
+    return g_load_mode == LoadMode::TensorCore && tc_consumer() == TcConsumer::Mma
+        ? g_options.tc_n / 2.0 : 0.0;
+}
+
+static void print_tc_json_fields()
+{
+    if (g_load_mode == LoadMode::TensorCore)
+        printf(",\"tc_consumer\":\"%s\",\"tc_n\":%d,\"mma_flops_per_input_byte\":%g",
+               g_options.tc_consumer.c_str(), g_options.tc_n, mma_flops_per_input_byte());
+}
+
+static void print_workload_csv_fields()
+{
+    printf(",%d,%d,%d,%s,%d,%g\n", g_options.load_mode, g_options.tma_stages,
+           g_options.blocks_per_sm,
+           g_load_mode == LoadMode::TensorCore ? g_options.tc_consumer.c_str() : "none",
+           g_load_mode == LoadMode::TensorCore ? g_options.tc_n : 0, mma_flops_per_input_byte());
 }
 
 int main(int argc, char **argv)
@@ -898,9 +1064,10 @@ int main(int argc, char **argv)
         CUDA_RT_CHECK(cudaStreamDestroy(stream));
         if (g_options.validate_only) {
             printf("{\"kind\":\"validation\",\"cases\":%zu,\"checked_float4s\":%zu,\"load_mode\":%d,"
-                   "\"tma_stages\":%d,\"tma_copy_only\":%s,\"completion_cases\":%zu}\n",
+                   "\"tma_stages\":%d,\"tma_copy_only\":%s,\"completion_cases\":%zu",
                     stats.cases, stats.checked_float4s, g_options.load_mode, g_options.tma_stages,
                     g_options.tma_copy_only ? "true" : "false", stats.completion_cases);
+            print_tc_json_fields(); printf("}\n");
             return 0;
         }
     }
@@ -914,7 +1081,7 @@ int main(int argc, char **argv)
             g_options.buffer_mb, l2_bytes, iters, trials, g_options.seed);
     size_t free_bytes = 0, total_bytes = 0;
     CUDA_RT_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
-    const size_t sink_size = static_cast<size_t>(totalSMs) * g_options.blocks_per_sm * 256 * sizeof(float);
+    const size_t sink_size = static_cast<size_t>(totalSMs) * g_options.blocks_per_sm * sink_values_per_block() * sizeof(float);
     if (buf_bytes > free_bytes || sink_size > free_bytes - buf_bytes) {
         fprintf(stderr, "Requested buffers do not fit free GPU memory (%zu bytes)\n", free_bytes);
         return EXIT_FAILURE;
@@ -923,7 +1090,7 @@ int main(int argc, char **argv)
     float *d_sink = nullptr;
     CUDA_RT_CHECK(cudaMalloc(&d_src, buf_bytes));
     CUDA_RT_CHECK(cudaMalloc(&d_sink, sink_size));
-    initialize_benchmark_input<<<totalSMs * 8, 256>>>(d_src, n_float4);
+    initialize_benchmark_input<<<totalSMs * 8, 256>>>(d_src, n_float4, g_load_mode == LoadMode::TensorCore);
     CUDA_RT_CHECK(cudaGetLastError());
     CUDA_RT_CHECK(cudaDeviceSynchronize());
     TmaContext tma{};
@@ -948,20 +1115,22 @@ int main(int argc, char **argv)
             ? measure_bandwidth_default(d_src, d_sink, n_float4, totalSMs, iters, trials, buf_bytes, tma)
             : measure_partition(g_options.sm_count, &allocated);
         printf("{\"kind\":\"single\",\"sm_count_requested\":%d,\"sm_count_allocated\":%u,"
-               "\"probe_observed_sm_count\":%u,\"bandwidth_GBps\":%.6f,\"tma_copy_only\":%s}\n",
+               "\"probe_observed_sm_count\":%u,\"bandwidth_GBps\":%.6f,\"tma_copy_only\":%s",
                 g_options.sm_count, allocated, g_probe_observed, bw,
                 g_options.tma_copy_only ? "true" : "false");
+        print_tc_json_fields(); printf("}\n");
     } else if (g_options.external_single) {
         double bw = measure_bandwidth_default(d_src, d_sink, n_float4, totalSMs, iters, trials, buf_bytes, tma);
         printf("{\"kind\":\"external_single\",\"bandwidth_GBps\":%.6f,\"tma_copy_only\":%s,"
                "\"observed_sm_count\":%zu,\"observed_sm_ids\":[",
                bw, g_options.tma_copy_only ? "true" : "false", ids.size());
-        print_sm_ids(ids); printf("]}\n");
+        print_sm_ids(ids); printf("]"); print_tc_json_fields(); printf("}\n");
     } else {
         double full = measure_bandwidth_default(d_src, d_sink, n_float4, totalSMs, iters, trials, buf_bytes, tma);
-        printf("sm_count_requested,sm_count_allocated,bandwidth_GBps,pct_of_full_gpu,probe_observed_sm_count,tma_copy_only\n");
-        printf("%u,%u,%.3f,100.0,%zu,%s\n", totalSMs, totalSMs, full, ids.size(),
+        printf("sm_count_requested,sm_count_allocated,bandwidth_GBps,pct_of_full_gpu,probe_observed_sm_count,tma_copy_only,load_mode,tma_stages,blocks_per_sm,tc_consumer,tc_n,mma_flops_per_input_byte\n");
+        printf("%u,%u,%.3f,100.0,%zu,%s", totalSMs, totalSMs, full, ids.size(),
                g_options.tma_copy_only ? "true" : "false");
+        print_workload_csv_fields();
         int minimum = cc_major >= 9 ? 8 : (cc_major == 8 ? 4 : (cc_major == 7 ? 2 : 1));
         int alignment = cc_major >= 9 ? 8 : (cc_major >= 7 ? 2 : 1);
         int step = g_options.sm_step ? std::max(g_options.sm_step, alignment) : alignment;
@@ -972,8 +1141,9 @@ int main(int argc, char **argv)
         for (unsigned int requested : counts) {
             unsigned int allocated = 0;
             double bw = measure_partition(requested, &allocated);
-            printf("%u,%u,%.3f,%.1f,%u,%s\n", requested, allocated, bw, 100.0 * bw / full, g_probe_observed,
+            printf("%u,%u,%.3f,%.1f,%u,%s", requested, allocated, bw, 100.0 * bw / full, g_probe_observed,
                    g_options.tma_copy_only ? "true" : "false");
+            print_workload_csv_fields();
             fflush(stdout);
         }
         double repeated = measure_bandwidth_default(d_src, d_sink, n_float4, totalSMs, iters, trials, buf_bytes, tma);

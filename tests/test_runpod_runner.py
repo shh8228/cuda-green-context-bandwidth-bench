@@ -48,7 +48,7 @@ class NsightReportTests(unittest.TestCase):
 
 
 class RunpodPreflightTests(unittest.TestCase):
-    def run_preflight(self, cuda="12.8", gpu="NVIDIA B200", cc="10.0", runner=RUNNER):
+    def run_preflight(self, cuda="12.8", gpu="NVIDIA B200", cc="10.0", runner=RUNNER, extra=()):
         # Only external discovery commands are replaced; the runner itself executes.
         with tempfile.TemporaryDirectory() as tmp:
             bindir = Path(tmp)
@@ -62,7 +62,7 @@ class RunpodPreflightTests(unittest.TestCase):
                 path.chmod(0o755)
             environment = dict(os.environ, PATH=f"{bindir}:{os.environ['PATH']}")
             return subprocess.run(
-                ["python3", str(runner), "--preflight-only"],
+                ["python3", str(runner), "--preflight-only", *extra],
                 capture_output=True, text=True, env=environment,
             )
 
@@ -77,6 +77,16 @@ class RunpodPreflightTests(unittest.TestCase):
         result = self.run_preflight(cuda="12.4")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("CUDA 12.8", result.stderr)
+
+    def test_tensor_core_mode_selects_architecture_specific_build(self):
+        result = self.run_preflight(extra=("--modes", "6"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["cuda_arch"], "sm_100a")
+
+    def test_tensor_core_mode_rejects_h200(self):
+        result = self.run_preflight(gpu="NVIDIA H200", cc="9.0", extra=("--modes", "6"))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("mode 6 requires B200", result.stderr)
 
     def test_wrong_gpu_is_rejected_before_building(self):
         result = self.run_preflight(gpu="NVIDIA H100", cc="9.0")
@@ -120,6 +130,42 @@ class RunpodPreflightTests(unittest.TestCase):
 
 
 class RunpodBuildTests(unittest.TestCase):
+    def test_tensor_core_sweep_preserves_shapes_consumers_and_sources(self):
+        spec = importlib.util.spec_from_file_location("runpod_tc", RUNNER)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        metadata = {"gpu": {"uuid": "GPU-test-b200"}, "gpu_family": "B200",
+                    "cuda_arch": "sm_100a", "nvcc_path": "/test/bin/nvcc"}
+        commands = []
+
+        def execute(command, **kwargs):
+            commands.append(command)
+            if "--external-probe" in command:
+                kwargs["stdout"].write('{"total_sm_count": 148}')
+            return subprocess.CompletedProcess(command, 0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "tc"
+            with contextlib.redirect_stdout(io.StringIO()), \
+                    patch.object(module, "preflight", return_value=metadata), \
+                    patch.object(module.subprocess, "run", side_effect=execute):
+                self.assertEqual(module.main(["--output-dir", str(output), "--modes", "6",
+                    "--blocks-per-sm", "24", "--tma-stages", "2,4", "--tc-n", "8,16,32",
+                    "--tc-consumers", "mma,sum,copy"]), 0)
+            manifest = json.loads((output / "manifest.json").read_text())
+            self.assertTrue(manifest["complete"])
+            self.assertIn("tma_tensor_core.cuh", manifest["source_sha256"])
+            self.assertIn("CUDA_ARCH=sm_100a", commands[0])
+            timed = [c for c in commands if "--require-dram" in c]
+            self.assertEqual(len(timed), 18)
+            actual = {(c[c.index("--tc-n") + 1], c[c.index("--tc-consumer") + 1],
+                       c[c.index("--tma-stages") + 1]) for c in timed}
+            self.assertEqual(actual, {(str(n), c, str(s)) for n in (8, 16, 32)
+                                     for c in ("mma", "sum", "copy") for s in (2, 4)})
+            validated = [c for c in commands if "--validate-only" in c and c[-1] == "6"]
+            self.assertEqual(len(validated), 18)
+            self.assertEqual(len(list(output.glob("mode6_*.csv"))), 18)
+
     def test_copy_only_reaches_tma_validation_and_timing_but_not_other_modes(self):
         spec = importlib.util.spec_from_file_location("runpod_copy_only", RUNNER)
         module = importlib.util.module_from_spec(spec)

@@ -18,6 +18,8 @@ class B200CliTests(unittest.TestCase):
         for option in ("--validate-only", "--tma-stages", "--blocks-per-sm", "--sm-count",
                        "--tma-copy-only", "--tc-consumer", "--tc-n", "--tc-schedule"):
             self.assertIn(option, result.stdout)
+        self.assertIn("serial (default)", result.stdout)
+        self.assertIn("refill", result.stdout)
 
     def test_copy_only_rejects_non_tma_work_before_cuda_initialization(self):
         result = subprocess.run([str(BINARY), "--tma-copy-only", "1", "1", "0", "0", "1", "1"],
@@ -40,6 +42,7 @@ class B200CliTests(unittest.TestCase):
             (["--tc-consumer", "mma"], "requires load_mode 6"),
             (["--tc-schedule", "bad", "1", "1", "0", "0", "1", "6"], "--tc-schedule must be"),
             (["--tc-schedule", "serial"], "requires load_mode 6"),
+            (["--tc-schedule", "refill"], "requires load_mode 6"),
             (["--tma-stages", "3"], "tma-stages"),
             (["--blocks-per-sm", "0"], "blocks-per-sm"),
             (["--sm-count", "-1"], "sm-count"),
@@ -100,7 +103,7 @@ class B200DeviceTests(unittest.TestCase):
 class TensorCoreDeviceTests(unittest.TestCase):
     def test_all_consumers_shapes_and_stage_counts_validate(self):
         for stages, n, consumer, schedule in product(
-                (2, 4, 8), (8, 16, 32), ("mma", "sum", "copy"), ("serial", "overlap")):
+                (2, 4, 8), (8, 16, 32), ("mma", "sum", "copy"), ("serial", "overlap", "refill")):
             with self.subTest(stages=stages, n=n, consumer=consumer, schedule=schedule):
                 result = subprocess.run(
                     [str(BINARY), "--validate-only", "--tc-consumer", consumer,
@@ -126,6 +129,6 @@ class TensorCoreDeviceTests(unittest.TestCase):
         self.assertEqual(record["sm_count_allocated"], 8)
         self.assertEqual(record["probe_observed_sm_count"], 8)
         self.assertEqual(record["tc_consumer"], "mma")
-        self.assertEqual(record["tc_schedule"], "overlap")
+        self.assertEqual(record["tc_schedule"], "serial")
         self.assertEqual(record["mma_flops_per_input_byte"], 4)
         self.assertGreater(record["bandwidth_GBps"], 0)

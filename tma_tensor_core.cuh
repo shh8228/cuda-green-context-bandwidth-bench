@@ -8,6 +8,7 @@
 // Four K=8 MMAs consume each 16 KiB A tile once. B is initialized once/CTA.
 
 enum class TcConsumer : int { Mma = 0, Sum = 1, Copy = 2 };
+enum class TcSchedule : int { Serial = 0, Overlap = 1, Refill = 2 };
 
 __host__ __device__ constexpr float tc_b_value(int k, int n)
 {
@@ -62,7 +63,7 @@ template<int Stages, int N>
 __global__ void __launch_bounds__(256, Stages == 2 ? 6 : 1)
 read_bandwidth_kernel_tc(float *sink, size_t n_float4,
                          const CUtensorMap *tensor_map, TcConsumer consumer,
-                         bool overlap)
+                         TcSchedule schedule)
 {
 #if defined(__CUDA_ARCH_FEAT_SM100_ALL)
     static_assert(N == 8 || N == 16 || N == 32, "supported N");
@@ -116,7 +117,7 @@ read_bandwidth_kernel_tc(float *sink, size_t n_float4,
     size_t iteration = 0;
     constexpr uint32_t idesc = (1U << 4) | (2U << 7) | (2U << 10) |
                                ((N / 8) << 17) | (8U << 24);
-    if (consumer == TcConsumer::Mma && overlap) {
+    if (consumer == TcConsumer::Mma && schedule != TcSchedule::Serial) {
         // All threads need this uniform count for the warp-collective epilogue.
         iteration = blockIdx.x < tiles ? 1 + (tiles - 1 - blockIdx.x) / gridDim.x : 0;
         if (threadIdx.x == 0) {
@@ -126,6 +127,10 @@ read_bandwidth_kernel_tc(float *sink, size_t n_float4,
             #pragma unroll
             for (int slice = 0; slice < 4; ++slice)
                 b_desc[slice] = tc_smem_desc(b + slice * N * 8, N * 16);
+            // Preserve the regressed policy as an explicit ablation. Delaying
+            // retirement by Stages-1 yields only one-tile TMA lookahead:
+            // (i-(Stages-1))+Stages == i+1. Immediate retirement restores i+Stages.
+            const size_t retire_lag = schedule == TcSchedule::Refill ? 0 : Stages - 1;
             for (size_t i = 0; i < iteration; ++i) {
                 int stage = i % Stages;
                 bars[stage].wait_parity((i / Stages) & 1);
@@ -139,10 +144,12 @@ read_bandwidth_kernel_tc(float *sink, size_t n_float4,
                 asm volatile("tcgen05.commit.cta_group::1.mbarrier::arrive::one.b64 [%0];"
                              :: "r"(bar) : "memory");
 
-                // Launch this tile before waiting on the oldest slot. Thus its
-                // MMA can overlap the oldest-slot wait and the following TMA.
-                if (i >= Stages - 1) {
-                    size_t retired = i - (Stages - 1);
+                // Refill waits this tile's MMA then immediately starts the
+                // far-future TMA, which can overlap subsequent tiles' MMAs.
+                // It intentionally sacrifices multi-tile MMA queuing to keep
+                // the configured TMA lookahead; no per-tile CTA barrier needed.
+                if (i >= retire_lag) {
+                    size_t retired = i - retire_lag;
                     int slot = retired % Stages;
                     mma_done[slot].wait_parity((retired / Stages) & 1);
                     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
@@ -152,7 +159,7 @@ read_bandwidth_kernel_tc(float *sink, size_t n_float4,
             }
             // Short CTAs may never have retired a slot. Wait every remaining
             // commit, not a guessed last-slot parity, before any TMEM loads.
-            size_t drained = iteration >= Stages ? iteration - Stages + 1 : 0;
+            size_t drained = iteration > retire_lag ? iteration - retire_lag : 0;
             for (size_t i = drained; i < iteration; ++i)
                 mma_done[i % Stages].wait_parity((i / Stages) & 1);
             asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");

@@ -502,8 +502,9 @@ static void launch_selected_kernel(const float4 *d_src, float *d_sink,
     case LoadMode::TensorCore: {
         TcConsumer consumer = check_tma_payload ? TcConsumer::Mma : tc_consumer();
         const CUtensorMap *map = tma_ctx.d_tensor_map;
-        bool overlap = g_options.tc_schedule == "overlap";
-        void *args[] = {&d_sink, &n_float4, &map, &consumer, &overlap};
+        TcSchedule schedule = g_options.tc_schedule == "serial" ? TcSchedule::Serial :
+            (g_options.tc_schedule == "refill" ? TcSchedule::Refill : TcSchedule::Overlap);
+        void *args[] = {&d_sink, &n_float4, &map, &consumer, &schedule};
         CUDA_RT_CHECK(cudaLaunchKernel(selected_tc_kernel(), dim3(blocks), dim3(threads),
                                       args, dynamic_shared_bytes(), stream));
         break;
@@ -979,7 +980,7 @@ static void print_usage(const char *program)
     printf("  --tma-copy-only     TMA transfer/wait control without tile reads or FP32 sums (mode 4)\n");
     printf("  --tc-consumer X     Mode 6: mma (default), sum, or copy; matched kernel/resources\n");
     printf("  --tc-n N            Mode 6: 8/16/32 columns; MMA intensity 4/8/16 FLOPs/input byte\n");
-    printf("  --tc-schedule X     Mode 6 MMA: overlap (default) or serial completion waits\n");
+    printf("  --tc-schedule X     Mode 6 MMA: serial (default), overlap, or refill (experimental)\n");
     printf("  --sm-count N        Measure one partition, emitting a single JSON record\n");
     printf("  --require-dram      Require input >= 4 times the GPU's L2 capacity\n");
     printf("  --seed N            Randomized sweep order (default 8228)\n");

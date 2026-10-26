@@ -123,20 +123,30 @@ consume each A tile; outputs accumulate in TMEM across that CTA's input tiles,
 then every output is read from TMEM and written to global memory once. No extra
 MMA repetitions are added to inflate arithmetic work.
 
-The default `--tc-schedule overlap` removes the CTA-wide barriers from MMA's
-tile loop. Thread 0 waits for a tile's TMA, issues its four MMAs and commits to
-that slot's completion barrier, then advances. Once the ring is occupied, it
-retires the oldest slot **after issuing the current tile's MMA**, waits for that
-old slot's reader to finish, and starts its replacement TMA. This permits MMA
-and TMA work on different slots to overlap without overwriting live operands.
-All outstanding MMAs are drained before the block joins for the epilogue.
+`--tc-schedule serial` is the default again after the deferred-refill `overlap`
+schedule regressed on B200. Three schedules remain in the same compiled kernel:
 
-`--tc-schedule serial` retains the per-tile MMA completion wait for comparison
-inside the same compiled kernel. Both schedules now store MMA outputs in
-column-major order (`output[n*128 + row]`), so adjacent warp lanes write adjacent
-floats. Thus the new serial/overlap comparison isolates the scheduling change;
-neither binary exactly reproduces the old strided output stores. Arithmetic,
-streaming input bytes, TMEM allocation and output byte counts are unchanged.
+| Schedule | MMA completion wait and TMA refill | Per-tile CTA barriers |
+|---|---|---|
+| `serial` (default) | Wait for tile i, then load i+Stages | Two |
+| `overlap` (regression control) | After issuing i, retire i-(Stages-1), then load i+1 | None |
+| `refill` (experimental) | Wait for tile i, then load i+Stages | None |
+
+The key issue in `overlap` is that delaying slot retirement until immediately
+before reuse collapses steady-state TMA lookahead to one tile, regardless of
+stage count. More shared memory can then reduce CTA residency without providing
+the intended extra TMA lookahead. This is a concrete schedule property, not proof
+of the entire measured slowdown's cause. `refill` changes retirement timing in
+the same single-issuer loop; it retains per-tile MMA waits to restore full TMA
+lookahead, rather than trying to keep multiple tiles' MMAs queued. Its performance
+has not been verified on B200. Keep the default serial until paired measurements
+justify a different choice.
+
+All issued transfers/MMAs are waited before output reads and deallocation. All
+schedules store MMA outputs in column-major order (`output[n*128 + row]`), so
+adjacent warp lanes write adjacent floats. Compare schedules in the same binary;
+none exactly reproduces the old strided output stores. Arithmetic, input bytes,
+TMEM allocation and output byte counts are unchanged across schedules.
 The two-stage specialization uses a six-CTA launch-bound register budget, to
 avoid losing residency just from the issuer's longer live ranges. This is a
 compiler resource constraint, not a guarantee of six active CTAs at runtime.
@@ -158,14 +168,14 @@ of reading TMEM. These are matched-resource controls, not instruction-identical
 workloads. They should be compared with mode-6 MMA, not silently substituted for
 the older mode-4 controls.
 The schedule option affects MMA only; copy/sum retain their per-tile control
-loops. In particular they do not share overlap MMA's reduced CTA synchronization.
+loops. In particular they do not share overlap/refill MMA's reduced CTA synchronization.
 `tc_schedule` in control results records the requested MMA schedule (also used
 for their out-of-timing payload validation), not a changed control loop.
 
 **Run from the updated checkout on B200:**
 
 ```bash
-# Build and check all modes; includes 54 TC shape/stage/consumer/schedule combinations.
+# Build and check all modes; includes 81 TC shape/stage/consumer/schedule combinations.
 make test-gpu CUDA_ARCH=sm_100a
 
 # Small first check inside an 8-SM green context (default N=8, MMA).
@@ -184,7 +194,7 @@ python3 run_b200_runpod.py --modes 6 --tc-n 8,16,32 --tc-consumers mma,sum,copy 
 
 # Compare scheduling with the same compiler, epilogue and resource reservations.
 # Run in reversed order in a second experiment to check thermal/clock drift.
-for schedule in serial overlap; do
+for schedule in serial overlap refill; do
   python3 run_b200_runpod.py --modes 6 --tc-n 8 --tc-consumers mma,copy \
     --tc-schedule "$schedule" --blocks-per-sm 24 --tma-stages 2,4 \
     --iterations 20 --trials 7 --output-dir "b200_tc_${schedule}"
@@ -192,7 +202,7 @@ done
 ```
 
 The runner selects `sm_100a` automatically when mode 6 is requested. Files include
-the shape, consumer and schedule, e.g. `mode6_blocks24_stages2_n8_mma_overlap.csv`. The manifest
+the shape, consumer and schedule, e.g. `mode6_blocks24_stages2_n8_mma_serial.csv`. The manifest
 preserves the source, build target and arguments; CSV records also identify N,
 consumer, `tc_schedule` and `mma_flops_per_input_byte` (zero for the non-MMA controls; this
 does not count SIMT sums). Use a new output directory for each run.

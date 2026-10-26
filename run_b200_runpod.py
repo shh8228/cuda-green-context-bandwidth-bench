@@ -40,7 +40,7 @@ def parser():
     p.add_argument("--tma-copy-only", action="store_true", help="TMA transfer/wait control without the SIMT consumer")
     p.add_argument("--tc-n", type=integer_list, default=(8,), help="mode 6 N values: 8,16,32 (4,8,16 FLOPs/input byte)")
     p.add_argument("--tc-consumers", default="mma", help="mode 6 consumers, comma-separated: mma,sum,copy")
-    p.add_argument("--tc-schedule", choices=("serial", "overlap"), default="overlap",
+    p.add_argument("--tc-schedule", choices=("serial", "overlap", "refill"), default="serial",
                    help="mode 6 MMA schedule; copy/sum keep their control loops")
     p.add_argument("--seed", type=int, default=8228)
     p.add_argument("--sanitize", action="store_true", help="also run memcheck, racecheck, and synccheck")

@@ -130,6 +130,12 @@ class RunpodPreflightTests(unittest.TestCase):
 
 
 class RunpodBuildTests(unittest.TestCase):
+    def test_unverified_overlap_is_not_the_default(self):
+        spec = importlib.util.spec_from_file_location("runpod_defaults", RUNNER)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        self.assertEqual(module.parser().parse_args([]).tc_schedule, "serial")
+
     def test_tensor_core_sweep_preserves_shapes_consumers_and_sources(self):
         spec = importlib.util.spec_from_file_location("runpod_tc", RUNNER)
         module = importlib.util.module_from_spec(spec)
@@ -151,7 +157,7 @@ class RunpodBuildTests(unittest.TestCase):
                     patch.object(module.subprocess, "run", side_effect=execute):
                 self.assertEqual(module.main(["--output-dir", str(output), "--modes", "6",
                     "--blocks-per-sm", "24", "--tma-stages", "2,4", "--tc-n", "8,16,32",
-                    "--tc-consumers", "mma,sum,copy", "--tc-schedule", "serial"]), 0)
+                    "--tc-consumers", "mma,sum,copy", "--tc-schedule", "refill"]), 0)
             manifest = json.loads((output / "manifest.json").read_text())
             self.assertTrue(manifest["complete"])
             self.assertIn("tma_tensor_core.cuh", manifest["source_sha256"])
@@ -165,8 +171,8 @@ class RunpodBuildTests(unittest.TestCase):
             validated = [c for c in commands if "--validate-only" in c and c[-1] == "6"]
             self.assertEqual(len(validated), 18)
             for command in timed + validated:
-                self.assertEqual(command[command.index("--tc-schedule") + 1], "serial")
-            self.assertEqual(len(list(output.glob("mode6_*_serial.csv"))), 18)
+                self.assertEqual(command[command.index("--tc-schedule") + 1], "refill")
+            self.assertEqual(len(list(output.glob("mode6_*_refill.csv"))), 18)
             self.assertEqual(len(list(output.glob("mode6_*.csv"))), 18)
 
     def test_copy_only_reaches_tma_validation_and_timing_but_not_other_modes(self):

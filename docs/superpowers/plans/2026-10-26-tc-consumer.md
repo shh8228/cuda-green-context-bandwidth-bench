@@ -58,6 +58,20 @@ N8/N16; a six-CTA launch bound reduced these to 37 without spills (N32: 35).
 Stage-4/8 code uses 48–53 registers with no spills. Host suite remains 54 passed,
 5 GPU tests skipped. Actual GPU correctness/sanitizers/performance are pending.
 
+## Regression investigation: refill timing
+
+User confirmed degraded results came from `b200_tc_overlap`. At 16 SM, N8,
+stages2/4 MMA fell to 1.547/0.807 TB/s while copy remained 2.693/1.998 TB/s.
+Tracing the loop gives replacement tile `(i-(Stages-1))+Stages = i+1`:
+after the initial fill it preserves only one tile of TMA lookahead.
+
+Restore `serial` as default. Preserve `overlap` for reproduction; add experimental
+`refill` with retirement lag zero in the same issuer loop. This waits the current
+MMA, refills i+Stages immediately, and retains the reduced CTA synchronization.
+Drain starts at max(0,tile_count-retire_lag); other computation/layout/resources
+are unchanged. Test all three schedules and their output provenance. Do not claim
+the measured slowdown is fully explained or recovered without B200 measurements.
+
 - Work in the existing clean checkout; do not commit or push without user instruction.
 - Proceed with the requested implementation directly; no approval checkpoint for reversible edits.
 - CLI and runner tests were observed failing before implementation, then passing.

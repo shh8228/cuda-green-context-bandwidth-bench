@@ -17,7 +17,7 @@ struct BenchOptions {
     bool tma_copy_only = false;
     int tc_n = 8;
     std::string tc_consumer = "mma";
-    std::string tc_schedule = "overlap";
+    std::string tc_schedule = "serial";
 };
 
 inline unsigned long long parse_integer(const char *value, const char *name,
@@ -71,8 +71,8 @@ inline BenchOptions parse_options(int argc, char **argv)
         throw std::invalid_argument("--tc-n must be 8, 16, or 32");
     if (o.tc_consumer != "mma" && o.tc_consumer != "sum" && o.tc_consumer != "copy")
         throw std::invalid_argument("--tc-consumer must be mma, sum, or copy");
-    if (o.tc_schedule != "serial" && o.tc_schedule != "overlap")
-        throw std::invalid_argument("--tc-schedule must be serial or overlap");
+    if (o.tc_schedule != "serial" && o.tc_schedule != "overlap" && o.tc_schedule != "refill")
+        throw std::invalid_argument("--tc-schedule must be serial, overlap, or refill");
     if (o.tma_stages != 2 && o.tma_stages != 4 && o.tma_stages != 8)
         throw std::invalid_argument("--tma-stages must be 2, 4, or 8");
     if (o.blocks_per_sm > 256)

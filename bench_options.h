@@ -14,6 +14,7 @@ struct BenchOptions {
     int blocks_per_sm = 32, tma_stages = 2, sm_count = 0, seed = 8228;
     bool help = false, external_single = false, external_probe = false;
     bool validate_only = false, skip_validation = false, require_dram = false;
+    bool tma_copy_only = false;
 };
 
 inline unsigned long long parse_integer(const char *value, const char *name,
@@ -41,6 +42,7 @@ inline BenchOptions parse_options(int argc, char **argv)
         else if (arg == "--validate-only") o.validate_only = true;
         else if (arg == "--skip-validation") o.skip_validation = true;
         else if (arg == "--require-dram") o.require_dram = true;
+        else if (arg == "--tma-copy-only") o.tma_copy_only = true;
         else if (arg == "--blocks-per-sm" || arg == "--tma-stages" ||
                  arg == "--sm-count" || arg == "--seed") {
             if (++i == argc) throw std::invalid_argument(arg + " requires a value");
@@ -86,5 +88,7 @@ inline BenchOptions parse_options(int argc, char **argv)
         }
     }
     if (o.load_mode > 5) throw std::invalid_argument("load_mode must be between 0 and 5");
+    if (o.tma_copy_only && o.load_mode != 4)
+        throw std::invalid_argument("--tma-copy-only requires load_mode 4");
     return o;
 }

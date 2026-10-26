@@ -37,6 +37,7 @@ def parser():
     p.add_argument("--modes", type=integer_list, default=(1, 4))
     p.add_argument("--blocks-per-sm", type=integer_list, default=(8, 32))
     p.add_argument("--tma-stages", type=integer_list, default=(2, 4, 8))
+    p.add_argument("--tma-copy-only", action="store_true", help="TMA transfer/wait control without the SIMT consumer")
     p.add_argument("--seed", type=int, default=8228)
     p.add_argument("--sanitize", action="store_true", help="also run memcheck, racecheck, and synccheck")
     p.add_argument("--profile", action="store_true", help="collect Nsight DRAM counters at 8 SMs, threshold, and full GPU")
@@ -195,7 +196,8 @@ def main(argv=None):
         total_sms = meta["residency_probe"]["total_sm_count"]
         for mode in range(6):
             for stages in (args.tma_stages if mode == 4 else (2,)):
-                command = [binary, "--validate-only", "--tma-stages", stages, "1", "1", "0", "0", "1", mode]
+                consumer = ["--tma-copy-only"] if args.tma_copy_only and mode == 4 else []
+                command = [binary, "--validate-only", *consumer, "--tma-stages", stages, "1", "1", "0", "0", "1", mode]
                 name = f"validate_mode{mode}_stages{stages}"
                 run(command, name, timeout=180)
                 if args.sanitize:
@@ -205,6 +207,8 @@ def main(argv=None):
         for mode, blocks, stages in configurations(args):
             name = f"mode{mode}_blocks{blocks}_stages{stages}"
             tuning = ["--blocks-per-sm", blocks, "--tma-stages", stages, "--seed", args.seed]
+            if args.tma_copy_only and mode == 4:
+                tuning.append("--tma-copy-only")
             run([binary, "--require-dram", *tuning, args.buffer_mb, args.iterations,
                  "0", "0", args.trials, mode], name, stdout_path=out / f"{name}.csv")
             run([sys.executable, source / "plot_results.py", out / f"{name}.csv", out / f"{name}.png"], f"{name}_plot")

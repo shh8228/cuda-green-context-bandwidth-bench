@@ -220,7 +220,8 @@ __global__ void __launch_bounds__(256)
 read_bandwidth_kernel_tma(const float4 *__restrict__ src,
                           float *__restrict__ sink,
                           size_t n_float4,
-                          const CUtensorMap *tensor_map)
+                          const CUtensorMap *tensor_map,
+                          bool consume)
 {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
     extern __shared__ __align__(128) unsigned char smem_tiles[];
@@ -259,21 +260,27 @@ read_bandwidth_kernel_tma(const float4 *__restrict__ src,
         // Each reuse advances this barrier by one phase; no arrival-token array needed.
         if (threadIdx.x == 0) bars[stage].wait_parity((iteration / Stages) & 1);
         __syncthreads();
-        const float4 *data = reinterpret_cast<const float4 *>(smem_tiles + stage * kTmaTileBytes);
-        for (size_t i = threadIdx.x; i < kTmaTileFloat4s; i += blockDim.x) {
-            if (tile * kTmaTileFloat4s + i < n_float4) {
-                float4 v = data[i];
-                accum.x += v.x; accum.y += v.y;
-                accum.z += v.z; accum.w += v.w;
+        // Runtime-uniform branch: both controls use the SAME compiled kernel,
+        // hence the same registers, shared memory and theoretical occupancy.
+        if (consume) {
+            const float4 *data = reinterpret_cast<const float4 *>(smem_tiles + stage * kTmaTileBytes);
+            for (size_t i = threadIdx.x; i < kTmaTileFloat4s; i += blockDim.x) {
+                if (tile * kTmaTileFloat4s + i < n_float4) {
+                    float4 v = data[i];
+                    accum.x += v.x; accum.y += v.y;
+                    accum.z += v.z; accum.w += v.w;
+                }
             }
         }
         __syncthreads();  // Protect buffer reuse until all consumers finish reading.
         size_t future_tile = tile + (size_t)Stages * gridDim.x;
         if (threadIdx.x == 0 && future_tile < tile_count) issue_tile(stage, future_tile);
     }
-    // Preserve every consumer's reads and make the entire tile checkable.
+    // Copy-only still waits for EVERY transfer, keeps both CTA barriers, and
+    // writes the completed-tile count to the same per-thread sink footprint.
+    // The volatile TMA asm above cannot be discarded with the consumer absent.
     sink[(size_t)blockIdx.x * blockDim.x + threadIdx.x] =
-        accum.x + accum.y + accum.z + accum.w;
+        consume ? accum.x + accum.y + accum.z + accum.w : static_cast<float>(iteration);
 #else
     // Never report a bandwidth for a kernel compiled without TMA support.
     __trap();
@@ -425,7 +432,8 @@ static bool build_tma_context(CUdevice cuDev, const float4 *d_src, size_t buf_by
 static void launch_selected_kernel(const float4 *d_src, float *d_sink,
                                    size_t n_float4, int blocks, int threads,
                                    cudaStream_t stream,
-                                   const TmaContext &tma_ctx)
+                                   const TmaContext &tma_ctx,
+                                   bool check_tma_payload = false)
 {
     const size_t shared_bytes = uses_shared_staging(g_load_mode)
         ? (size_t)threads * sizeof(float4)
@@ -446,9 +454,9 @@ static void launch_selected_kernel(const float4 *d_src, float *d_sink,
         break;
     case LoadMode::Tma:
         switch (g_options.tma_stages) {
-        case 2: read_bandwidth_kernel_tma<2><<<blocks, threads, 2 * kTmaTileBytes, stream>>>(d_src, d_sink, n_float4, tma_ctx.d_tensor_map); break;
-        case 4: read_bandwidth_kernel_tma<4><<<blocks, threads, 4 * kTmaTileBytes, stream>>>(d_src, d_sink, n_float4, tma_ctx.d_tensor_map); break;
-        case 8: read_bandwidth_kernel_tma<8><<<blocks, threads, 8 * kTmaTileBytes, stream>>>(d_src, d_sink, n_float4, tma_ctx.d_tensor_map); break;
+        case 2: read_bandwidth_kernel_tma<2><<<blocks, threads, 2 * kTmaTileBytes, stream>>>(d_src, d_sink, n_float4, tma_ctx.d_tensor_map, check_tma_payload || !g_options.tma_copy_only); break;
+        case 4: read_bandwidth_kernel_tma<4><<<blocks, threads, 4 * kTmaTileBytes, stream>>>(d_src, d_sink, n_float4, tma_ctx.d_tensor_map, check_tma_payload || !g_options.tma_copy_only); break;
+        case 8: read_bandwidth_kernel_tma<8><<<blocks, threads, 8 * kTmaTileBytes, stream>>>(d_src, d_sink, n_float4, tma_ctx.d_tensor_map, check_tma_payload || !g_options.tma_copy_only); break;
         }
         break;
     case LoadMode::DecodeLike:
@@ -504,10 +512,10 @@ static void configure_selected_kernel(int cc_major, int dev_id)
     CUDA_RT_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
         &resident_blocks, selected_kernel(), 256, dynamic_bytes));
     fprintf(stderr, "Kernel configuration: mode=%d PTX=sm_%d registers=%d "
-            "shared_bytes=%zu resident_blocks_per_sm=%d blocks_per_sm=%d tma_stages=%d\n",
+            "shared_bytes=%zu resident_blocks_per_sm=%d blocks_per_sm=%d tma_stages=%d tma_copy_only=%d\n",
             static_cast<int>(g_load_mode), attr.ptxVersion, attr.numRegs,
             dynamic_bytes + attr.sharedSizeBytes, resident_blocks,
-            g_options.blocks_per_sm, g_options.tma_stages);
+            g_options.blocks_per_sm, g_options.tma_stages, g_options.tma_copy_only);
 }
 
 static int grid_blocks(size_t n_float4, int sms)
@@ -527,7 +535,7 @@ static float validation_value(size_t index, unsigned lane)
     return static_cast<float>(static_cast<int>(x & 15U) - 7);
 }
 
-struct ValidationStats { size_t cases = 0, checked_float4s = 0; };
+struct ValidationStats { size_t cases = 0, checked_float4s = 0, completion_cases = 0; };
 
 static ValidationStats validate_selected_kernel(CUdevice device, cudaStream_t stream)
 {
@@ -565,7 +573,9 @@ static ValidationStats validate_selected_kernel(CUdevice device, cudaStream_t st
                 expected[owner] += (static_cast<double>(v.x) + v.y + v.z + v.w) * weight;
             }
             CUDA_RT_CHECK(cudaMemsetAsync(sink, 0xff, expected.size() * sizeof(float), stream));
-            launch_selected_kernel(src, sink, count, blocks, 256, stream, tma);
+            // Validate payload with the consume branch of the same kernel;
+            // these shared-memory reads are OUTSIDE benchmark timing.
+            launch_selected_kernel(src, sink, count, blocks, 256, stream, tma, true);
             CUDA_RT_CHECK(cudaStreamSynchronize(stream));
             std::vector<float> actual(expected.size());
             CUDA_RT_CHECK(cudaMemcpy(actual.data(), sink, actual.size() * sizeof(float), cudaMemcpyDeviceToHost));
@@ -581,6 +591,26 @@ static ValidationStats validate_selected_kernel(CUdevice device, cudaStream_t st
             }
             ++stats.cases;
             stats.checked_float4s += count;
+            if (g_options.tma_copy_only) {
+                // Exercise the actual no-consumer branch too, including idle
+                // CTAs, partial tiles and repeated barrier phases.
+                CUDA_RT_CHECK(cudaMemsetAsync(sink, 0xff, actual.size() * sizeof(float), stream));
+                launch_selected_kernel(src, sink, count, blocks, 256, stream, tma);
+                CUDA_RT_CHECK(cudaStreamSynchronize(stream));
+                CUDA_RT_CHECK(cudaMemcpy(actual.data(), sink, actual.size() * sizeof(float), cudaMemcpyDeviceToHost));
+                const size_t tiles = (count + kTmaTileFloat4s - 1) / kTmaTileFloat4s;
+                for (size_t i = 0; i < actual.size(); ++i) {
+                    const size_t block = i / 256;
+                    const float completed = static_cast<float>(tiles / blocks + (block < tiles % blocks));
+                    if (actual[i] != completed) {
+                        fprintf(stderr, "Copy-only completion FAILED stages=%d bytes=%zu blocks=%d "
+                                "sink=%zu expected=%g actual=%g\n",
+                                g_options.tma_stages, bytes, blocks, i, completed, actual[i]);
+                        exit(EXIT_FAILURE);
+                    }
+                }
+                ++stats.completion_cases;
+            }
         }
         if (tma.enabled) CUDA_RT_CHECK(cudaFree(tma.d_tensor_map));
         CUDA_RT_CHECK(cudaFree(src));
@@ -588,6 +618,9 @@ static ValidationStats validate_selected_kernel(CUdevice device, cudaStream_t st
     }
     fprintf(stderr, "Validation PASSED: %zu cases, %zu float4 inputs checked\n",
             stats.cases, stats.checked_float4s);
+    if (g_options.tma_copy_only)
+        fprintf(stderr, "Copy-only completion checks PASSED: %zu cases; payload checked separately outside timing\n",
+                stats.completion_cases);
     return stats;
 }
 
@@ -797,6 +830,7 @@ static void print_usage(const char *program)
     printf("  --skip-validation   Skip correctness checks (profiling after validation only)\n");
     printf("  --blocks-per-sm N   Queued CTAs per allocated SM, 1..256 (default 32)\n");
     printf("  --tma-stages N      TMA pipeline stages: 2, 4, or 8 (default 2)\n");
+    printf("  --tma-copy-only     TMA transfer/wait control without tile reads or FP32 sums (mode 4)\n");
     printf("  --sm-count N        Measure one partition, emitting a single JSON record\n");
     printf("  --require-dram      Require input >= 4 times the GPU's L2 capacity\n");
     printf("  --seed N            Randomized sweep order (default 8228)\n");
@@ -863,8 +897,10 @@ int main(int argc, char **argv)
         auto stats = validate_selected_kernel(cuDev, stream);
         CUDA_RT_CHECK(cudaStreamDestroy(stream));
         if (g_options.validate_only) {
-            printf("{\"kind\":\"validation\",\"cases\":%zu,\"checked_float4s\":%zu,\"load_mode\":%d,\"tma_stages\":%d}\n",
-                    stats.cases, stats.checked_float4s, g_options.load_mode, g_options.tma_stages);
+            printf("{\"kind\":\"validation\",\"cases\":%zu,\"checked_float4s\":%zu,\"load_mode\":%d,"
+                   "\"tma_stages\":%d,\"tma_copy_only\":%s,\"completion_cases\":%zu}\n",
+                    stats.cases, stats.checked_float4s, g_options.load_mode, g_options.tma_stages,
+                    g_options.tma_copy_only ? "true" : "false", stats.completion_cases);
             return 0;
         }
     }
@@ -912,16 +948,20 @@ int main(int argc, char **argv)
             ? measure_bandwidth_default(d_src, d_sink, n_float4, totalSMs, iters, trials, buf_bytes, tma)
             : measure_partition(g_options.sm_count, &allocated);
         printf("{\"kind\":\"single\",\"sm_count_requested\":%d,\"sm_count_allocated\":%u,"
-               "\"probe_observed_sm_count\":%u,\"bandwidth_GBps\":%.6f}\n",
-                g_options.sm_count, allocated, g_probe_observed, bw);
+               "\"probe_observed_sm_count\":%u,\"bandwidth_GBps\":%.6f,\"tma_copy_only\":%s}\n",
+                g_options.sm_count, allocated, g_probe_observed, bw,
+                g_options.tma_copy_only ? "true" : "false");
     } else if (g_options.external_single) {
         double bw = measure_bandwidth_default(d_src, d_sink, n_float4, totalSMs, iters, trials, buf_bytes, tma);
-        printf("{\"kind\":\"external_single\",\"bandwidth_GBps\":%.6f,\"observed_sm_count\":%zu,\"observed_sm_ids\":[", bw, ids.size());
+        printf("{\"kind\":\"external_single\",\"bandwidth_GBps\":%.6f,\"tma_copy_only\":%s,"
+               "\"observed_sm_count\":%zu,\"observed_sm_ids\":[",
+               bw, g_options.tma_copy_only ? "true" : "false", ids.size());
         print_sm_ids(ids); printf("]}\n");
     } else {
         double full = measure_bandwidth_default(d_src, d_sink, n_float4, totalSMs, iters, trials, buf_bytes, tma);
-        printf("sm_count_requested,sm_count_allocated,bandwidth_GBps,pct_of_full_gpu,probe_observed_sm_count\n");
-        printf("%u,%u,%.3f,100.0,%zu\n", totalSMs, totalSMs, full, ids.size());
+        printf("sm_count_requested,sm_count_allocated,bandwidth_GBps,pct_of_full_gpu,probe_observed_sm_count,tma_copy_only\n");
+        printf("%u,%u,%.3f,100.0,%zu,%s\n", totalSMs, totalSMs, full, ids.size(),
+               g_options.tma_copy_only ? "true" : "false");
         int minimum = cc_major >= 9 ? 8 : (cc_major == 8 ? 4 : (cc_major == 7 ? 2 : 1));
         int alignment = cc_major >= 9 ? 8 : (cc_major >= 7 ? 2 : 1);
         int step = g_options.sm_step ? std::max(g_options.sm_step, alignment) : alignment;
@@ -932,7 +972,8 @@ int main(int argc, char **argv)
         for (unsigned int requested : counts) {
             unsigned int allocated = 0;
             double bw = measure_partition(requested, &allocated);
-            printf("%u,%u,%.3f,%.1f,%u\n", requested, allocated, bw, 100.0 * bw / full, g_probe_observed);
+            printf("%u,%u,%.3f,%.1f,%u,%s\n", requested, allocated, bw, 100.0 * bw / full, g_probe_observed,
+                   g_options.tma_copy_only ? "true" : "false");
             fflush(stdout);
         }
         double repeated = measure_bandwidth_default(d_src, d_sink, n_float4, totalSMs, iters, trials, buf_bytes, tma);

@@ -120,6 +120,38 @@ class RunpodPreflightTests(unittest.TestCase):
 
 
 class RunpodBuildTests(unittest.TestCase):
+    def test_copy_only_reaches_tma_validation_and_timing_but_not_other_modes(self):
+        spec = importlib.util.spec_from_file_location("runpod_copy_only", RUNNER)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        metadata = {"gpu": {"uuid": "GPU-test-b200"}, "gpu_family": "B200",
+                    "cuda_arch": "sm_100", "nvcc_path": "/test/bin/nvcc"}
+        commands = []
+
+        def execute(command, **kwargs):
+            commands.append(command)
+            if "--external-probe" in command:
+                kwargs["stdout"].write('{"total_sm_count": 148}')
+            return subprocess.CompletedProcess(command, 0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "copy-only"
+            with contextlib.redirect_stdout(io.StringIO()), \
+                    patch.object(module, "preflight", return_value=metadata), \
+                    patch.object(module.subprocess, "run", side_effect=execute):
+                self.assertEqual(module.main(["--output-dir", str(output), "--modes", "4",
+                                              "--blocks-per-sm", "24", "--tma-stages", "2",
+                                              "--tma-copy-only"]), 0)
+            manifest = json.loads((output / "manifest.json").read_text())
+            self.assertTrue(manifest["arguments"]["tma_copy_only"])
+            validation = [c for c in commands if "--validate-only" in c]
+            self.assertEqual(len(validation), 6)
+            for command in validation:
+                self.assertEqual("--tma-copy-only" in command, command[-1] == "4")
+            timed = [c for c in commands if "--require-dram" in c]
+            self.assertEqual(len(timed), 1)
+            self.assertIn("--tma-copy-only", timed[0])
+
     def test_h200_build_uses_detected_arch_and_preserves_sources(self):
         spec = importlib.util.spec_from_file_location("runpod_build", RUNNER)
         module = importlib.util.module_from_spec(spec)

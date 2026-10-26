@@ -14,8 +14,16 @@ class B200CliTests(unittest.TestCase):
     def test_help_exposes_validation_and_tma_tuning_without_a_gpu(self):
         result = subprocess.run([str(BINARY), "--help"], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
-        for option in ("--validate-only", "--tma-stages", "--blocks-per-sm", "--sm-count"):
+        for option in ("--validate-only", "--tma-stages", "--blocks-per-sm", "--sm-count",
+                       "--tma-copy-only"):
             self.assertIn(option, result.stdout)
+
+    def test_copy_only_rejects_non_tma_work_before_cuda_initialization(self):
+        result = subprocess.run([str(BINARY), "--tma-copy-only", "1", "1", "0", "0", "1", "1"],
+                                capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--tma-copy-only requires load_mode 4", result.stderr)
+        self.assertNotIn("cuInit", result.stderr)
 
     def test_invalid_parameters_are_rejected_before_cuda_initialization(self):
         cases = [
@@ -40,6 +48,19 @@ class B200CliTests(unittest.TestCase):
 
 @unittest.skipUnless(os.environ.get("RUN_CUDA_TESTS") == "1", "requires a CUDA GPU")
 class B200DeviceTests(unittest.TestCase):
+    def test_copy_only_checks_payload_and_repeated_transfer_completions(self):
+        for stages in (2, 4, 8):
+            with self.subTest(stages=stages):
+                result = subprocess.run(
+                    [str(BINARY), "--validate-only", "--tma-copy-only", "--tma-stages", str(stages),
+                     "1", "1", "0", "0", "1", "4"],
+                    capture_output=True, text=True, timeout=120)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                record = json.loads(result.stdout)
+                self.assertTrue(record["tma_copy_only"])
+                self.assertEqual(record["completion_cases"], record["cases"])
+                self.assertGreater(record["checked_float4s"], 16384)
+
     def test_every_load_mode_validates_varied_input_and_partial_tiles(self):
         for mode in range(6):
             for stages in ((2, 4, 8) if mode == 4 else (2,)):

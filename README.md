@@ -64,6 +64,53 @@ An error stops the runner and leaves `complete: false` in the manifest. The buil
 
 A separate residency probe reports the SMs available to a context; it does not instrument the timed kernel or prove that every allocated SM was busy throughout it. Compare absolute bandwidth as well as each configuration's own 95% threshold. The L2-size check (input >= 4x L2) reduces cache contamination but does not prove that the counted bytes reached DRAM; use the profiler's `dram__bytes_read.sum` for that check.
 
+### TMA consumer control: transfer/wait versus FP32 consumption
+
+The ordinary TMA kernel transfers each 16 KiB tile into shared memory, then all
+256 threads read its contents into registers and accumulate FP32 sums. To test
+whether that consumer limits the rate at which buffers can be reused, add
+`--tma-copy-only` to the runner or to mode 4 of the standalone benchmark.
+
+Both paths use the **same compiled kernel** with a runtime-uniform consumer flag.
+They retain the same tile mapping, pipeline depth, thread/block count, shared
+allocation, register allocation, theoretical occupancy limit, TMA issue/wait
+operations, two CTA barriers per tile, and per-thread sink writes. The control
+skips tile reads and FP32 sums; each thread instead writes its block's completed
+tile count. Every issued TMA transfer is still waited on before buffer reuse and
+kernel completion. Reported bandwidth counts input bytes, not shared-memory or
+sink traffic. This conservative control retains unused consumer resources and
+does not measure an independently optimized TMA-only engine.
+
+Validation first checks full payload sums using the consuming branch of that
+same kernel, then separately checks the actual copy-only branch's completion
+counts, including partial tiles, idle blocks and repeated barrier phases. The
+payload checks execute outside timing; copy-only sink values do not themselves
+check payload contents. Run Compute Sanitizer on the actual GPU before relying
+on new device results.
+
+For a paired full SM sweep on B200 (use new output directories):
+
+```bash
+python3 run_b200_runpod.py --modes 4 --blocks-per-sm 24 --tma-stages 2,4 \
+  --iterations 20 --trials 7 --seed 8229 --output-dir b200_consume
+python3 run_b200_runpod.py --modes 4 --blocks-per-sm 24 --tma-stages 2,4 \
+  --iterations 20 --trials 7 --seed 8229 --tma-copy-only --output-dir b200_copy_only
+```
+
+Repeat in reversed order and compare absolute GB/s against one common full-GPU
+reference, as well as each path's own full-GPU value. Monitor clocks, temperature,
+power and baseline drift. A smaller threshold relative to a slower path's own
+baseline does not establish better use of HBM.
+
+If copy-only is faster at the same SM allocation, the removed shared-memory
+reads, FP32 work, and their delay of future TMA issues limit the original loop.
+This does **not** isolate shared-memory read ports, register delivery, arithmetic
+dependencies, or scheduler issue overhead individually. If the curves coincide,
+the consumer is not the dominant constraint under that configuration; this alone
+does not identify a hardware request-queue limit. Neither result predicts Tensor
+Core performance: a real WGMMA/TCGEN05 consumer has different operand layouts,
+synchronization, accumulator storage, and useful computation.
+
 ## Motivation
 
 When spatially partitioning a GPU with CUDA Green Contexts (e.g., for disaggregated serving, MPS-like workload isolation, or co-located inference), a key question is: **how many SMs are actually needed to saturate memory bandwidth?** If a memory-bound kernel saturates DRAM bandwidth with only a fraction of available SMs, the remaining SMs can be allocated to compute-bound work without degrading memory throughput.

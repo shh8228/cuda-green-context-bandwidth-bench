@@ -17,6 +17,7 @@ struct BenchOptions {
     bool tma_copy_only = false;
     int tc_n = 8;
     std::string tc_consumer = "mma";
+    std::string tc_schedule = "overlap";
 };
 
 inline unsigned long long parse_integer(const char *value, const char *name,
@@ -46,9 +47,10 @@ inline BenchOptions parse_options(int argc, char **argv)
         else if (arg == "--skip-validation") o.skip_validation = true;
         else if (arg == "--require-dram") o.require_dram = true;
         else if (arg == "--tma-copy-only") o.tma_copy_only = true;
-        else if (arg == "--tc-consumer") {
+        else if (arg == "--tc-consumer" || arg == "--tc-schedule") {
             if (++i == argc) throw std::invalid_argument(arg + " requires a value");
-            o.tc_consumer = argv[i];
+            if (arg == "--tc-consumer") o.tc_consumer = argv[i];
+            else o.tc_schedule = argv[i];
             tc_option = true;
         }
         else if (arg == "--blocks-per-sm" || arg == "--tma-stages" ||
@@ -69,6 +71,8 @@ inline BenchOptions parse_options(int argc, char **argv)
         throw std::invalid_argument("--tc-n must be 8, 16, or 32");
     if (o.tc_consumer != "mma" && o.tc_consumer != "sum" && o.tc_consumer != "copy")
         throw std::invalid_argument("--tc-consumer must be mma, sum, or copy");
+    if (o.tc_schedule != "serial" && o.tc_schedule != "overlap")
+        throw std::invalid_argument("--tc-schedule must be serial or overlap");
     if (o.tma_stages != 2 && o.tma_stages != 4 && o.tma_stages != 8)
         throw std::invalid_argument("--tma-stages must be 2, 4, or 8");
     if (o.blocks_per_sm > 256)
@@ -77,7 +81,7 @@ inline BenchOptions parse_options(int argc, char **argv)
         (o.sm_count && (o.external_single || o.external_probe || o.validate_only)))
         throw std::invalid_argument("Select only one execution mode");
     if (o.external_probe) {
-        if (tc_option) throw std::invalid_argument("--tc-n/--tc-consumer requires load_mode 6");
+        if (tc_option) throw std::invalid_argument("--tc-n/--tc-consumer/--tc-schedule requires load_mode 6");
         if (positional.size() > 1) throw std::invalid_argument("--external-probe accepts only gpu_id");
         if (!positional.empty()) o.gpu_id = parse_integer(positional[0], "gpu_id", 0);
         return o;
@@ -103,7 +107,7 @@ inline BenchOptions parse_options(int argc, char **argv)
     }
     if (o.load_mode > 6) throw std::invalid_argument("load_mode must be between 0 and 6");
     if (tc_option && o.load_mode != 6)
-        throw std::invalid_argument("--tc-n/--tc-consumer requires load_mode 6");
+        throw std::invalid_argument("--tc-n/--tc-consumer/--tc-schedule requires load_mode 6");
     if (o.tma_copy_only && o.load_mode != 4)
         throw std::invalid_argument("--tma-copy-only requires load_mode 4");
     return o;

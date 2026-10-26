@@ -1,5 +1,6 @@
 """CLI checks run without a GPU; opt in to device tests with RUN_CUDA_TESTS=1."""
 import json
+from itertools import product
 import os
 from pathlib import Path
 import subprocess
@@ -15,7 +16,7 @@ class B200CliTests(unittest.TestCase):
         result = subprocess.run([str(BINARY), "--help"], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         for option in ("--validate-only", "--tma-stages", "--blocks-per-sm", "--sm-count",
-                       "--tma-copy-only", "--tc-consumer", "--tc-n"):
+                       "--tma-copy-only", "--tc-consumer", "--tc-n", "--tc-schedule"):
             self.assertIn(option, result.stdout)
 
     def test_copy_only_rejects_non_tma_work_before_cuda_initialization(self):
@@ -37,6 +38,8 @@ class B200CliTests(unittest.TestCase):
             (["--tc-consumer", "bad", "1", "1", "0", "0", "1", "6"], "--tc-consumer must be"),
             (["--tc-n", "8"], "requires load_mode 6"),
             (["--tc-consumer", "mma"], "requires load_mode 6"),
+            (["--tc-schedule", "bad", "1", "1", "0", "0", "1", "6"], "--tc-schedule must be"),
+            (["--tc-schedule", "serial"], "requires load_mode 6"),
             (["--tma-stages", "3"], "tma-stages"),
             (["--blocks-per-sm", "0"], "blocks-per-sm"),
             (["--sm-count", "-1"], "sm-count"),
@@ -96,22 +99,22 @@ class B200DeviceTests(unittest.TestCase):
 @unittest.skipUnless(os.environ.get("RUN_TCGEN05_TESTS") == "1", "requires B200 and sm_100a")
 class TensorCoreDeviceTests(unittest.TestCase):
     def test_all_consumers_shapes_and_stage_counts_validate(self):
-        for stages in (2, 4, 8):
-            for n in (8, 16, 32):
-                for consumer in ("mma", "sum", "copy"):
-                    with self.subTest(stages=stages, n=n, consumer=consumer):
-                        result = subprocess.run(
-                            [str(BINARY), "--validate-only", "--tc-consumer", consumer,
-                             "--tc-n", str(n), "--tma-stages", str(stages),
-                             "1", "1", "0", "0", "1", "6"],
-                            capture_output=True, text=True, timeout=120)
-                        self.assertEqual(result.returncode, 0, result.stderr)
-                        record = json.loads(result.stdout)
-                        self.assertEqual(record["tc_consumer"], consumer)
-                        self.assertEqual(record["tc_n"], n)
-                        self.assertEqual(record["cases"], 18)
-                        self.assertGreater(record["checked_float4s"], 16384)
-                        self.assertEqual(record["completion_cases"], 18 if consumer == "copy" else 0)
+        for stages, n, consumer, schedule in product(
+                (2, 4, 8), (8, 16, 32), ("mma", "sum", "copy"), ("serial", "overlap")):
+            with self.subTest(stages=stages, n=n, consumer=consumer, schedule=schedule):
+                result = subprocess.run(
+                    [str(BINARY), "--validate-only", "--tc-consumer", consumer,
+                     "--tc-n", str(n), "--tma-stages", str(stages), "--tc-schedule", schedule,
+                     "1", "1", "0", "0", "1", "6"],
+                    capture_output=True, text=True, timeout=120)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                record = json.loads(result.stdout)
+                self.assertEqual(record["tc_consumer"], consumer)
+                self.assertEqual(record["tc_schedule"], schedule)
+                self.assertEqual(record["tc_n"], n)
+                self.assertEqual(record["cases"], 33)
+                self.assertGreater(record["checked_float4s"], 16384)
+                self.assertEqual(record["completion_cases"], 33 if consumer == "copy" else 0)
 
     def test_mma_in_a_small_green_context(self):
         result = subprocess.run(
@@ -123,5 +126,6 @@ class TensorCoreDeviceTests(unittest.TestCase):
         self.assertEqual(record["sm_count_allocated"], 8)
         self.assertEqual(record["probe_observed_sm_count"], 8)
         self.assertEqual(record["tc_consumer"], "mma")
+        self.assertEqual(record["tc_schedule"], "overlap")
         self.assertEqual(record["mma_flops_per_input_byte"], 4)
         self.assertGreater(record["bandwidth_GBps"], 0)

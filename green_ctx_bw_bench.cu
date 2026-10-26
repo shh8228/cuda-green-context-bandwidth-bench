@@ -502,7 +502,8 @@ static void launch_selected_kernel(const float4 *d_src, float *d_sink,
     case LoadMode::TensorCore: {
         TcConsumer consumer = check_tma_payload ? TcConsumer::Mma : tc_consumer();
         const CUtensorMap *map = tma_ctx.d_tensor_map;
-        void *args[] = {&d_sink, &n_float4, &map, &consumer};
+        bool overlap = g_options.tc_schedule == "overlap";
+        void *args[] = {&d_sink, &n_float4, &map, &consumer, &overlap};
         CUDA_RT_CHECK(cudaLaunchKernel(selected_tc_kernel(), dim3(blocks), dim3(threads),
                                       args, dynamic_shared_bytes(), stream));
         break;
@@ -570,10 +571,10 @@ static void configure_selected_kernel(int cc_major, int dev_id)
             dynamic_bytes + attr.sharedSizeBytes, resident_blocks,
             g_options.blocks_per_sm, g_options.tma_stages, g_options.tma_copy_only);
     if (g_load_mode == LoadMode::TensorCore)
-        fprintf(stderr, "TCGEN05: consumer=%s A=128x32 B=32x%d TF32; mma_flops_per_input_byte=%g; "
+        fprintf(stderr, "TCGEN05: consumer=%s tc_schedule=%s (MMA only) A=128x32 B=32x%d TF32; mma_flops_per_input_byte=%g; "
                 "tmem_columns_per_cta=32 sink_bytes_per_cta=%zu. "
                 "Bandwidth counts streaming A only; B setup and output are timed.\n",
-                g_options.tc_consumer.c_str(), g_options.tc_n,
+                g_options.tc_consumer.c_str(), g_options.tc_schedule.c_str(), g_options.tc_n,
                 tc_consumer() == TcConsumer::Mma ? g_options.tc_n / 2.0 : 0.0,
                 sink_values_per_block() * sizeof(float));
 }
@@ -600,7 +601,10 @@ struct ValidationStats { size_t cases = 0, checked_float4s = 0, completion_cases
 static ValidationStats validate_tc_kernel(CUdevice device, cudaStream_t stream)
 {
     ValidationStats stats;
-    const size_t sizes[] = {256, 16128, 16384, 16640, 65792, 1048832};
+    // Short rings, exact ring boundaries, partial tails and multiple phase wraps.
+    const size_t sizes[] = {256, 16128, 16384, 16640, 65792, 1048832,
+        7 * kTmaTileBytes, 8 * kTmaTileBytes, 8 * kTmaTileBytes + 256,
+        16 * kTmaTileBytes, 16 * kTmaTileBytes + 256};
     const int grids[] = {1, 3, 17};
     const size_t output_stride = sink_values_per_block();
     for (size_t bytes : sizes) {
@@ -627,7 +631,7 @@ static ValidationStats validate_tc_kernel(CUdevice device, cudaStream_t stream)
                 for (int n = 0; n < g_options.tc_n; ++n) {
                     // Independent expression for deterministic B coefficients.
                     double weight = ((17 * k + 13 * n + 3 * k * n) % 127 - 63) / 64.0;
-                    expected[block * output_stride + row * g_options.tc_n + n] += input[p] * weight;
+                    expected[block * output_stride + n * 128 + row] += input[p] * weight;
                 }
                 sums[block * 256 + (offset / 4) % 256] += input[p];
             }
@@ -641,9 +645,9 @@ static ValidationStats validate_tc_kernel(CUdevice device, cudaStream_t stream)
                     // Integer inputs and B in multiples of 1/64 keep this workload
                     // exactly representable even across repeated MMA tiles.
                     if (actual[j] != reference[j]) {
-                        fprintf(stderr, "TC validation FAILED consumer=%s N=%d stages=%d "
+                        fprintf(stderr, "TC validation FAILED consumer=%s schedule=%s N=%d stages=%d "
                                 "bytes=%zu blocks=%d output=%zu expected=%.9g actual=%.9g\n",
-                                payload ? "mma" : g_options.tc_consumer.c_str(),
+                                payload ? "mma" : g_options.tc_consumer.c_str(), g_options.tc_schedule.c_str(),
                                 g_options.tc_n, g_options.tma_stages, bytes, blocks,
                                 j, reference[j], actual[j]);
                         exit(EXIT_FAILURE);
@@ -975,6 +979,7 @@ static void print_usage(const char *program)
     printf("  --tma-copy-only     TMA transfer/wait control without tile reads or FP32 sums (mode 4)\n");
     printf("  --tc-consumer X     Mode 6: mma (default), sum, or copy; matched kernel/resources\n");
     printf("  --tc-n N            Mode 6: 8/16/32 columns; MMA intensity 4/8/16 FLOPs/input byte\n");
+    printf("  --tc-schedule X     Mode 6 MMA: overlap (default) or serial completion waits\n");
     printf("  --sm-count N        Measure one partition, emitting a single JSON record\n");
     printf("  --require-dram      Require input >= 4 times the GPU's L2 capacity\n");
     printf("  --seed N            Randomized sweep order (default 8228)\n");
@@ -1001,16 +1006,18 @@ static double mma_flops_per_input_byte()
 static void print_tc_json_fields()
 {
     if (g_load_mode == LoadMode::TensorCore)
-        printf(",\"tc_consumer\":\"%s\",\"tc_n\":%d,\"mma_flops_per_input_byte\":%g",
-               g_options.tc_consumer.c_str(), g_options.tc_n, mma_flops_per_input_byte());
+        printf(",\"tc_consumer\":\"%s\",\"tc_n\":%d,\"mma_flops_per_input_byte\":%g,\"tc_schedule\":\"%s\"",
+               g_options.tc_consumer.c_str(), g_options.tc_n, mma_flops_per_input_byte(),
+               g_options.tc_schedule.c_str());
 }
 
 static void print_workload_csv_fields()
 {
-    printf(",%d,%d,%d,%s,%d,%g\n", g_options.load_mode, g_options.tma_stages,
+    printf(",%d,%d,%d,%s,%d,%g,%s\n", g_options.load_mode, g_options.tma_stages,
            g_options.blocks_per_sm,
            g_load_mode == LoadMode::TensorCore ? g_options.tc_consumer.c_str() : "none",
-           g_load_mode == LoadMode::TensorCore ? g_options.tc_n : 0, mma_flops_per_input_byte());
+           g_load_mode == LoadMode::TensorCore ? g_options.tc_n : 0, mma_flops_per_input_byte(),
+           g_load_mode == LoadMode::TensorCore ? g_options.tc_schedule.c_str() : "none");
 }
 
 int main(int argc, char **argv)
@@ -1127,7 +1134,7 @@ int main(int argc, char **argv)
         print_sm_ids(ids); printf("]"); print_tc_json_fields(); printf("}\n");
     } else {
         double full = measure_bandwidth_default(d_src, d_sink, n_float4, totalSMs, iters, trials, buf_bytes, tma);
-        printf("sm_count_requested,sm_count_allocated,bandwidth_GBps,pct_of_full_gpu,probe_observed_sm_count,tma_copy_only,load_mode,tma_stages,blocks_per_sm,tc_consumer,tc_n,mma_flops_per_input_byte\n");
+        printf("sm_count_requested,sm_count_allocated,bandwidth_GBps,pct_of_full_gpu,probe_observed_sm_count,tma_copy_only,load_mode,tma_stages,blocks_per_sm,tc_consumer,tc_n,mma_flops_per_input_byte,tc_schedule\n");
         printf("%u,%u,%.3f,100.0,%zu,%s", totalSMs, totalSMs, full, ids.size(),
                g_options.tma_copy_only ? "true" : "false");
         print_workload_csv_fields();

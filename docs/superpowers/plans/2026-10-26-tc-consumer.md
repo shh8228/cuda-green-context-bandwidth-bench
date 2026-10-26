@@ -30,6 +30,34 @@
 
 ## Execution notes
 
+## Follow-up: overlap optimization
+
+User requested optimization after measuring serial MMA overhead. Implement inline;
+retain `--tc-schedule serial` in the same compiled kernel, default `overlap`.
+Only MMA changes schedule; copy/sum retain their control loops and reservations.
+
+- [x] Test schedule CLI/provenance, both schedules and all consumers/shapes/stages.
+- [x] Add one MMA completion barrier per shared slot. Thread 0 issues MMA without
+  per-tile CTA barriers, retires the oldest slot after issuing the next available
+  MMA tile, and refills it only after its prior MMA is complete. Drain all remaining
+  commits before epilogue/TMEM deallocation, including short/idle CTAs.
+- [x] Store MMA outputs column-major so warp stores are contiguous; update the
+  independent CPU reference and add exact ring-boundary/tail validation sizes.
+- [x] Wire runner/JSON/CSV/log schedule labels and document serial comparison.
+- [x] Compile all targets, inspect PTX, run host tests, request independent review.
+
+Same-shape accumulation is ordered within one issuing thread by TCGEN05 pipelining.
+The new serial mode shares the improved epilogue, so it isolates scheduling from
+the output layout optimization; it is not a bit-for-bit old executable baseline.
+Runtime speedup remains unmeasured without B200 access.
+
+Follow-up verification: CLI/runner tests failed on the missing schedule option,
+then passed after implementation. Independent review found no concrete defects
+and checked ring/parity counts 0–999. Initial stage-2 code used 46 registers for
+N8/N16; a six-CTA launch bound reduced these to 37 without spills (N32: 35).
+Stage-4/8 code uses 48–53 registers with no spills. Host suite remains 54 passed,
+5 GPU tests skipped. Actual GPU correctness/sanitizers/performance are pending.
+
 - Work in the existing clean checkout; do not commit or push without user instruction.
 - Proceed with the requested implementation directly; no approval checkpoint for reversible edits.
 - CLI and runner tests were observed failing before implementation, then passing.

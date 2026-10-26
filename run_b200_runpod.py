@@ -40,6 +40,8 @@ def parser():
     p.add_argument("--tma-copy-only", action="store_true", help="TMA transfer/wait control without the SIMT consumer")
     p.add_argument("--tc-n", type=integer_list, default=(8,), help="mode 6 N values: 8,16,32 (4,8,16 FLOPs/input byte)")
     p.add_argument("--tc-consumers", default="mma", help="mode 6 consumers, comma-separated: mma,sum,copy")
+    p.add_argument("--tc-schedule", choices=("serial", "overlap"), default="overlap",
+                   help="mode 6 MMA schedule; copy/sum keep their control loops")
     p.add_argument("--seed", type=int, default=8228)
     p.add_argument("--sanitize", action="store_true", help="also run memcheck, racecheck, and synccheck")
     p.add_argument("--profile", action="store_true", help="collect Nsight DRAM counters at 8 SMs, threshold, and full GPU")
@@ -103,7 +105,7 @@ def configurations(args):
 
 def consumer_options(args, mode, n, consumer):
     if mode == 6:
-        return ["--tc-n", n, "--tc-consumer", consumer]
+        return ["--tc-n", n, "--tc-consumer", consumer, "--tc-schedule", args.tc_schedule]
     return ["--tma-copy-only"] if mode == 4 and args.tma_copy_only else []
 
 
@@ -217,7 +219,7 @@ def main(argv=None):
         validation_args.blocks_per_sm = (1,)
         for mode, _, stages, n, consumer in configurations(validation_args):
             extra = consumer_options(args, mode, n, consumer)
-            suffix = f"_n{n}_{consumer}" if mode == 6 else ""
+            suffix = f"_n{n}_{consumer}_{args.tc_schedule}" if mode == 6 else ""
             command = [binary, "--validate-only", *extra, "--tma-stages", stages, "1", "1", "0", "0", "1", mode]
             name = f"validate_mode{mode}_stages{stages}{suffix}"
             run(command, name, timeout=180)
@@ -226,7 +228,7 @@ def main(argv=None):
                     run(["compute-sanitizer", "--tool", tool, "--error-exitcode", "1", *command],
                         f"{name}_{tool}", timeout=600)
         for mode, blocks, stages, n, consumer in configurations(args):
-            suffix = f"_n{n}_{consumer}" if mode == 6 else ""
+            suffix = f"_n{n}_{consumer}_{args.tc_schedule}" if mode == 6 else ""
             name = f"mode{mode}_blocks{blocks}_stages{stages}{suffix}"
             tuning = ["--blocks-per-sm", blocks, "--tma-stages", stages, "--seed", args.seed]
             tuning += consumer_options(args, mode, n, consumer)

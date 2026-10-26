@@ -151,7 +151,7 @@ class RunpodBuildTests(unittest.TestCase):
                     patch.object(module.subprocess, "run", side_effect=execute):
                 self.assertEqual(module.main(["--output-dir", str(output), "--modes", "6",
                     "--blocks-per-sm", "24", "--tma-stages", "2,4", "--tc-n", "8,16,32",
-                    "--tc-consumers", "mma,sum,copy"]), 0)
+                    "--tc-consumers", "mma,sum,copy", "--tc-schedule", "serial"]), 0)
             manifest = json.loads((output / "manifest.json").read_text())
             self.assertTrue(manifest["complete"])
             self.assertIn("tma_tensor_core.cuh", manifest["source_sha256"])
@@ -164,6 +164,9 @@ class RunpodBuildTests(unittest.TestCase):
                                      for c in ("mma", "sum", "copy") for s in (2, 4)})
             validated = [c for c in commands if "--validate-only" in c and c[-1] == "6"]
             self.assertEqual(len(validated), 18)
+            for command in timed + validated:
+                self.assertEqual(command[command.index("--tc-schedule") + 1], "serial")
+            self.assertEqual(len(list(output.glob("mode6_*_serial.csv"))), 18)
             self.assertEqual(len(list(output.glob("mode6_*.csv"))), 18)
 
     def test_copy_only_reaches_tma_validation_and_timing_but_not_other_modes(self):

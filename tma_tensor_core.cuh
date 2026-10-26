@@ -57,9 +57,12 @@ __device__ __forceinline__ void tc_load8(uint32_t address, float (&values)[8])
 #endif
 
 template<int Stages, int N>
-__global__ void __launch_bounds__(256)
+// Two-stage shared buffers fit six CTAs on B200. Keep the async issuer's
+// register live ranges from unnecessarily reducing that residency budget.
+__global__ void __launch_bounds__(256, Stages == 2 ? 6 : 1)
 read_bandwidth_kernel_tc(float *sink, size_t n_float4,
-                         const CUtensorMap *tensor_map, TcConsumer consumer)
+                         const CUtensorMap *tensor_map, TcConsumer consumer,
+                         bool overlap)
 {
 #if defined(__CUDA_ARCH_FEAT_SM100_ALL)
     static_assert(N == 8 || N == 16 || N == 32, "supported N");
@@ -69,7 +72,7 @@ read_bandwidth_kernel_tc(float *sink, size_t n_float4,
     #pragma nv_diag_suppress static_var_with_dynamic_init
     __shared__ cuda::barrier<cuda::thread_scope_block> bars[Stages];
     #pragma nv_diag_suppress static_var_with_dynamic_init
-    __shared__ cuda::barrier<cuda::thread_scope_block> mma_done;
+    __shared__ cuda::barrier<cuda::thread_scope_block> mma_done[Stages];
     __shared__ uint32_t tmem;
     for (int i = threadIdx.x; i < N * 32; i += blockDim.x) {
         // Decode canonical packed B offset independently of A's descriptor.
@@ -78,8 +81,10 @@ read_bandwidth_kernel_tc(float *sink, size_t n_float4,
         b[i] = tc_b_value(k, n);
     }
     if (threadIdx.x == 0) {
-        for (int s = 0; s < Stages; ++s) init(&bars[s], 1);
-        init(&mma_done, 1);
+        for (int s = 0; s < Stages; ++s) {
+            init(&bars[s], 1);
+            init(&mma_done[s], 1);
+        }
     }
     // Each writer publishes its generic shared writes to async consumers.
     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
@@ -111,45 +116,91 @@ read_bandwidth_kernel_tc(float *sink, size_t n_float4,
     size_t iteration = 0;
     constexpr uint32_t idesc = (1U << 4) | (2U << 7) | (2U << 10) |
                                ((N / 8) << 17) | (8U << 24);
-    for (size_t tile = blockIdx.x; tile < tiles; tile += gridDim.x, ++iteration) {
-        int stage = iteration % Stages;
-        if (threadIdx.x == 0) bars[stage].wait_parity((iteration / Stages) & 1);
-        __syncthreads();
-        asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
-        const float *a = reinterpret_cast<const float *>(tc_storage + stage * kTmaTileBytes);
-        if (consumer == TcConsumer::Mma && threadIdx.x == 0) {
+    if (consumer == TcConsumer::Mma && overlap) {
+        // All threads need this uniform count for the warp-collective epilogue.
+        iteration = blockIdx.x < tiles ? 1 + (tiles - 1 - blockIdx.x) / gridDim.x : 0;
+        if (threadIdx.x == 0) {
+            // One issuer controls both async engines; other threads join only
+            // after the ring has drained. Same-shape MMA accumulation is pipelined.
+            uint64_t b_desc[4];
             #pragma unroll
             for (int slice = 0; slice < 4; ++slice)
-                tc_mma(tmem, tc_smem_desc(a + slice * 1024, 2048),
-                       tc_smem_desc(b + slice * N * 8, N * 16), idesc,
-                       iteration != 0 || slice != 0);
-        } else if (consumer == TcConsumer::Sum) {
-            const float4 *v = reinterpret_cast<const float4 *>(a);
-            for (size_t i = threadIdx.x; i < kTmaTileFloat4s; i += blockDim.x) {
-                // TMA zero-fills the tail, but match the original SUM's guard.
-                if (tile * kTmaTileFloat4s + i < n_float4) {
-                    float4 x = v[i];
-                    accum.x += x.x; accum.y += x.y; accum.z += x.z; accum.w += x.w;
-                }
-            }
-        }
-        if (threadIdx.x == 0) {
-            if (consumer == TcConsumer::Mma) {
-                uint32_t bar = __cvta_generic_to_shared(cuda::device::barrier_native_handle(mma_done));
+                b_desc[slice] = tc_smem_desc(b + slice * N * 8, N * 16);
+            for (size_t i = 0; i < iteration; ++i) {
+                int stage = i % Stages;
+                bars[stage].wait_parity((i / Stages) & 1);
+                asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+                const float *a = reinterpret_cast<const float *>(tc_storage + stage * kTmaTileBytes);
+                #pragma unroll
+                for (int slice = 0; slice < 4; ++slice)
+                    tc_mma(tmem, tc_smem_desc(a + slice * 1024, 2048), b_desc[slice],
+                           idesc, i != 0 || slice != 0);
+                uint32_t bar = __cvta_generic_to_shared(cuda::device::barrier_native_handle(mma_done[stage]));
                 asm volatile("tcgen05.commit.cta_group::1.mbarrier::arrive::one.b64 [%0];"
                              :: "r"(bar) : "memory");
-            } else {
-                (void)mma_done.arrive();
+
+                // Launch this tile before waiting on the oldest slot. Thus its
+                // MMA can overlap the oldest-slot wait and the following TMA.
+                if (i >= Stages - 1) {
+                    size_t retired = i - (Stages - 1);
+                    int slot = retired % Stages;
+                    mma_done[slot].wait_parity((retired / Stages) & 1);
+                    asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+                    if (retired + Stages < iteration)
+                        issue_tile(slot, blockIdx.x + (retired + Stages) * gridDim.x);
+                }
             }
-            mma_done.wait_parity(iteration & 1);
+            // Short CTAs may never have retired a slot. Wait every remaining
+            // commit, not a guessed last-slot parity, before any TMEM loads.
+            size_t drained = iteration >= Stages ? iteration - Stages + 1 : 0;
+            for (size_t i = drained; i < iteration; ++i)
+                mma_done[i % Stages].wait_parity((i / Stages) & 1);
             asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
             asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
         }
-        // No TMA stage overwrite until MMA has finished reading both operands
-        // and all SIMT readers (if selected) have finished.
         __syncthreads();
-        if (threadIdx.x == 0 && tile + size_t(Stages) * gridDim.x < tiles)
-            issue_tile(stage, tile + size_t(Stages) * gridDim.x);
+    } else {
+        // Serial MMA baseline and the original SIMT/copy control schedules.
+        for (size_t tile = blockIdx.x; tile < tiles; tile += gridDim.x, ++iteration) {
+            int stage = iteration % Stages;
+            if (threadIdx.x == 0) bars[stage].wait_parity((iteration / Stages) & 1);
+            __syncthreads();
+            asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+            const float *a = reinterpret_cast<const float *>(tc_storage + stage * kTmaTileBytes);
+            if (consumer == TcConsumer::Mma && threadIdx.x == 0) {
+                #pragma unroll
+                for (int slice = 0; slice < 4; ++slice)
+                    tc_mma(tmem, tc_smem_desc(a + slice * 1024, 2048),
+                           tc_smem_desc(b + slice * N * 8, N * 16), idesc,
+                           iteration != 0 || slice != 0);
+            } else if (consumer == TcConsumer::Sum) {
+                const float4 *v = reinterpret_cast<const float4 *>(a);
+                for (size_t i = threadIdx.x; i < kTmaTileFloat4s; i += blockDim.x) {
+                    // TMA zero-fills the tail, but match the original SUM's guard.
+                    if (tile * kTmaTileFloat4s + i < n_float4) {
+                        float4 x = v[i];
+                        accum.x += x.x; accum.y += x.y; accum.z += x.z; accum.w += x.w;
+                    }
+                }
+            }
+            if (threadIdx.x == 0) {
+                if (consumer == TcConsumer::Mma) {
+                    uint32_t bar = __cvta_generic_to_shared(cuda::device::barrier_native_handle(mma_done[0]));
+                    asm volatile("tcgen05.commit.cta_group::1.mbarrier::arrive::one.b64 [%0];"
+                                 :: "r"(bar) : "memory");
+                } else {
+                    (void)mma_done[0].arrive();
+                }
+                mma_done[0].wait_parity(iteration & 1);
+                asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+                asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
+            }
+            // No TMA stage overwrite until MMA has finished reading both operands
+            // and all SIMT readers (if selected) have finished.
+            __syncthreads();
+            if (threadIdx.x == 0 && tile + size_t(Stages) * gridDim.x < tiles)
+                issue_tile(stage, tile + size_t(Stages) * gridDim.x);
+        }
     }
     float *out = sink + size_t(blockIdx.x) * 128 * N;
     if (consumer == TcConsumer::Mma && iteration != 0) {
@@ -162,7 +213,9 @@ read_bandwidth_kernel_tc(float *sink, size_t n_float4,
                 float v[8];
                 tc_load8(tmem + (row_base << 16) + col, v);
                 #pragma unroll
-                for (int j = 0; j < 8; ++j) out[threadIdx.x * N + col + j] = v[j];
+                // Column-major output: adjacent lanes write adjacent floats.
+                // Applied to both schedules, so their comparison isolates the loop.
+                for (int j = 0; j < 8; ++j) out[(col + j) * 128 + threadIdx.x] = v[j];
             }
         }
     } else {

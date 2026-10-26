@@ -250,6 +250,11 @@ read_bandwidth_kernel_tma(const float4 *__restrict__ src,
             :: "r"(dst), "l"(tensor_map), "r"(row), "r"(bar) : "memory");
     };
     if (threadIdx.x == 0) {
+        // The descriptor was copied from the host into device global memory.
+        // Kernel launch does not acquire the tensormap proxy. Thread 0 issues
+        // every TMA in this CTA; acquire once because the map stays immutable.
+        asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;"
+                     :: "l"(tensor_map) : "memory");
         for (int s = 0; s < Stages; ++s) {
             size_t tile = blockIdx.x + (size_t)s * gridDim.x;
             if (tile < tile_count) issue_tile(s, tile);

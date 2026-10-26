@@ -108,10 +108,16 @@ read_bandwidth_kernel_tc(float *sink, size_t n_float4,
                      "[%0], [%1, {0, %2}], [%3];"
                      :: "r"(dst), "l"(tensor_map), "r"(row), "r"(bar) : "memory");
     };
-    if (threadIdx.x == 0)
+    if (threadIdx.x == 0) {
+        // Host cudaMemcpy publishes an immutable global-memory descriptor.
+        // Each CTA's issuing thread must acquire the tensormap proxy at system
+        // scope before its first TMA; the shared async-proxy fence is separate.
+        asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;"
+                     :: "l"(tensor_map) : "memory");
         for (int s = 0; s < Stages; ++s)
             if (blockIdx.x + size_t(s) * gridDim.x < tiles)
                 issue_tile(s, blockIdx.x + size_t(s) * gridDim.x);
+    }
 
     float4 accum = make_float4(0.f, 0.f, 0.f, 0.f);
     size_t iteration = 0;

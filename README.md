@@ -62,6 +62,23 @@ Artifacts are saved under `h200_results/<UTC timestamp>/` or `b200_results/<UTC 
 
 An error stops the runner and leaves `complete: false` in the manifest. The built-in checks cover all output threads, partial tiles, idle CTAs, and repeated TMA barrier phases using varied integer input and a CPU reference. These checks do not replace running the sanitizer suite on the actual GPU.
 
+**Tensor-map ordering correction:** modes 4 and 6 now acquire the host-copied
+global descriptor with `fence.proxy.tensormap::generic.acquire.sys [map], 128`
+once in each CTA's issuing thread, before its first TMA request. The descriptor
+is immutable during a launch. The separate shared-memory async fence does not
+acquire this proxy, and kernel launch does not implicitly do so either; see
+[NVIDIA's descriptor-transfer rules](https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/async-copies.html#using-tma-to-transfer-multi-dimensional-arrays).
+Earlier versions omitted this required acquire. Passing output checks did not
+establish correct ordering. Keep those measurements labeled as pre-fix data and
+repeat validation/timing with the fixed source; the omission alone does not prove
+stale descriptors were observed or bandwidth was inflated. The acquire's runtime
+cost is included in the timed kernel.
+
+`make test-ptx CUDA_ARCH=sm_100a` checks system-scope acquire emission and its
+descriptor operand in all 12 TMA/TC specializations without a GPU; use `sm_90`
+for the three Hopper TMA variants. This is an emission regression check, not a
+general control-flow proof or a substitute for `make test-gpu` on the device.
+
 A separate residency probe reports the SMs available to a context; it does not instrument the timed kernel or prove that every allocated SM was busy throughout it. Compare absolute bandwidth as well as each configuration's own 95% threshold. The L2-size check (input >= 4x L2) reduces cache contamination but does not prove that the counted bytes reached DRAM; use the profiler's `dram__bytes_read.sum` for that check.
 
 ### TMA consumer control: transfer/wait versus FP32 consumption

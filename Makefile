@@ -12,7 +12,7 @@ LDFLAGS    := -L$(CUDA_ROOT)/lib64/stubs -L$(CUDA_ROOT)/lib/stubs -lcuda
 TARGET     := green_ctx_bw_bench
 SRC        := green_ctx_bw_bench.cu
 
-.PHONY: all clean run run-large plot test test-gpu FORCE
+.PHONY: all clean run run-large plot test test-gpu test-ptx FORCE
 
 all: $(TARGET)
 
@@ -39,6 +39,12 @@ test: $(TARGET)
 
 test-gpu: $(TARGET)
 	RUN_CUDA_TESTS=1 RUN_TCGEN05_TESTS=$(if $(filter sm_100a,$(CUDA_ARCH)),1,0) BENCHMARK_BINARY=$(abspath $(TARGET)) python3 -m unittest discover -s tests -v
+
+# Verify descriptor-proxy acquire emission without a GPU.
+test-ptx:
+	@ptx=$$(mktemp); trap 'rm -f "$$ptx"' EXIT; \
+	$(NVCC) $(NVCC_FLAGS) --ptx $(SRC) -o "$$ptx" && \
+	BENCHMARK_PTX="$$ptx" python3 -m unittest discover -s tests -p test_tma_ptx.py -v
 
 clean:
 	rm -f $(TARGET) results.csv *.png
